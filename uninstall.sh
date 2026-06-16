@@ -1,5 +1,5 @@
 #!/bin/bash
 
 echo "Removing HollaEx CLI..."
-curl -L https://raw.githubusercontent.com/bitholla/hollaex-cli/master/uninstall.sh | bash
+curl -L https://raw.githubusercontent.com/bitachaien/goldvninvest-cli/master/uninstall.sh | bash
 
