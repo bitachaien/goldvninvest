@@ -1,0 +1,84 @@
+# Dev mode HollaEx Kit Docker-Copmose
+version: '3'
+services:
+  hollaex-kit-redis:
+    image: redis:8.0.2-alpine
+    depends_on:
+      - hollaex-kit-db
+    networks:
+      - hollaex-kit-network
+    ports:
+      - 6379:6379
+    environment:
+      - REDIS_PASSWORD=bitholla
+    command : ["sh", "-c", "redis-server --requirepass $${REDIS_PASSWORD}"]
+  hollaex-kit-db:
+    image: postgres:14.9
+    ports:
+      - 5432:5432
+    environment:
+      - POSTGRES_DB=hollaex
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=root
+    networks:
+      - hollaex-kit-network
+  hollaex-kit-server:
+    image: hollaex-kit-server
+    ports:
+      - 10010:10010
+      - 10011:10011
+      - 10012:10012
+      - 10013:10013
+    build:
+      context: .
+      dockerfile: ./tools/Dockerfile
+    env_file:
+      - ./tools/hollaex-kit.env.local
+    entrypoint:
+      - /bin/sh
+      - -c
+      - cp /app/.package-lock.json.build /app/package-lock.json && pm2-runtime start ecosystem.config.js --env development;
+    volumes:
+      - ./api:/app/api
+      - ./config:/app/config
+      - ./db:/app/db
+      - ./plugins:/app/plugins
+      - ./mail:/app/mail
+      - ./ws:/app/ws
+      - ./app.js:/app/app.js
+      - ./ecosystem.config.js:/app/ecosystem.config.js
+      - ./constants.js:/app/constants.js
+      - ./messages.js:/app/messages.js
+      - ./logs:/app/logs
+      - ./test:/app/test
+      - ./tools/dbs:/app/tools/dbs
+      - ./tools/general:/app/tools/general
+      - ./utils:/app/utils
+      - /app/utils/hollaex-network-lib/node_modules
+      - /app/utils/hollaex-tools-lib/node_modules
+      - ./init.js:/app/init.js
+      - ./package-lock.json:/app/package-lock.json
+      - ../plugins/src/plugins:/app/dev-plugins
+    depends_on:
+      - hollaex-kit-db
+      - hollaex-kit-redis
+    networks:
+      - hollaex-kit-network
+  hollaex-kit-nginx:
+    image: nginx:1.15.8-alpine
+    volumes:
+      - ./tools/nginx-dev:/etc/nginx
+      - ./tools/nginx-dev/conf.d:/etc/nginx/conf.d
+      - ./tools/nginx-dev/logs:/var/log
+      - ./tools/nginx-dev/static:/usr/share/nginx/html
+    ports:
+      - 80:80
+    environment:
+      - NGINX_PORT=80
+    depends_on:
+      - hollaex-kit-server
+    networks:
+      - hollaex-kit-network
+
+networks:
+  hollaex-kit-network:

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg version="1.2" baseProfile="tiny" id="Layer_1" xmlns="http://www.w3.org/2000/svg"
+	 x="0px" y="0px" viewBox="0 0 60 60" overflow="visible" xml:space="preserve">
+<g fill="none" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+	<rect x="14" y="7" width="27" height="46" rx="3.5"/>
+	<line x1="24" y1="12" x2="31" y2="12"/>
+	<line x1="14" y1="17" x2="41" y2="17"/>
+	<line x1="14" y1="46" x2="41" y2="46"/>
+</g>
+<circle fill="#FFFFFF" cx="27.5" cy="49.5" r="1.7"/>
+<circle id="Ellipse_110" fill="#FFFF00" cx="46.5" cy="21" r="12"/>
+<g>
+	<path d="M45.5,26.1h1.9V28h-1.9V26.1z M45.6,19.3v-4h1.7v4l-0.4,5H46L45.6,19.3z"/>
+</g>
+</svg>

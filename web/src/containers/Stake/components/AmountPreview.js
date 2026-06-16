@@ -1,0 +1,77 @@
+import React from 'react';
+import { connect } from 'react-redux';
+import mathjs from 'mathjs';
+import { EditWrapper, Coin } from 'components';
+import STRINGS from 'config/localizedStrings';
+import withConfig from 'components/ConfigProvider/withConfig';
+import { formatToCurrency } from 'utils/currency';
+import {
+	CURRENCY_PRICE_FORMAT,
+	APPROXIMATELY_EQAUL_CURRENCY_PRICE_FORMAT,
+	DEFAULT_COIN_DATA,
+} from 'config/constants';
+import { WS_QUOTE_CURRENCY } from 'actions/assetActions';
+
+const AmountPreview = ({
+	amount = 0,
+	symbol: token = 'xht',
+	labelId = 'STAKE.AMOUNT_LABEL',
+	coins,
+	icons: ICONS,
+	price,
+	wsPriceData = {},
+	oraclePrices = {},
+}) => {
+	const displayCurrency =
+		localStorage.getItem('base_currnecy') || WS_QUOTE_CURRENCY;
+	const { min: baseMin, display_name: base_display = '' } =
+		coins[displayCurrency] || DEFAULT_COIN_DATA;
+	const { min: tokenMin, display_name: token_display = '', icon_id } =
+		coins[token] || DEFAULT_COIN_DATA;
+
+	const format = (value, displayName, min, format = CURRENCY_PRICE_FORMAT) =>
+		STRINGS.formatString(format, formatToCurrency(value, min), displayName);
+
+	const formatToken = (value) => format(value, token_display, tokenMin);
+	const formatBase = (value) =>
+		format(
+			value,
+			base_display,
+			baseMin,
+			APPROXIMATELY_EQAUL_CURRENCY_PRICE_FORMAT
+		);
+
+	const amountValue = wsPriceData[displayCurrency]
+		? mathjs.multiply(amount, price) / wsPriceData[displayCurrency]
+		: mathjs.multiply(amount, oraclePrices[token]);
+
+	return (
+		<div className="pt-4">
+			<div className="bold">
+				<EditWrapper stringId={labelId}>{STRINGS[labelId]}</EditWrapper>
+			</div>
+			<div className="d-flex align-center pt-2">
+				<div>
+					<Coin iconId={icon_id} type="CS12" />
+				</div>
+				<div className="stake-amount pl-2">
+					<div>{formatToken(amount)}</div>
+					<div className="secondary-text small">{formatBase(amountValue)}</div>
+				</div>
+			</div>
+		</div>
+	);
+};
+
+const mapStateToProps = (store, { symbol }) => {
+	const price = store.asset.wsPriceData[symbol];
+
+	return {
+		coins: store.app.coins,
+		price,
+		wsPriceData: store.asset.wsPriceData,
+		oraclePrices: store.asset.oraclePrices,
+	};
+};
+
+export default connect(mapStateToProps)(withConfig(AmountPreview));

@@ -1,0 +1,225 @@
+'use strict';
+
+const { isEmail } = require('validator');
+const { formatDate, getCountryFromIp, sendSMTPEmail, sendSMTPTestEmail } = require('./utils');
+const payloadTemplate = require('./templates/helpers/payloadTemplate');
+const { loggerEmail } = require('../config/logger');
+const { getValidLanguage } = require('./utils');
+const { MAILTYPE } = require('./strings');
+const generateMessageContent = require('./templates');
+const { GET_KIT_CONFIG, GET_KIT_SECRETS, DOMAIN } = require('../constants');
+const trimEmail = (v) => (typeof v === 'string' ? v.trim() : '');
+const AUDIT_EMAIL = () => trimEmail(GET_KIT_SECRETS().emails.audit);
+const SENSITIVE_AUDIT_EMAIL = () =>
+	trimEmail(GET_KIT_SECRETS().emails.audit_sensitive ?? AUDIT_EMAIL());
+const AUDIT_ENABLED = () => GET_KIT_SECRETS().emails.audit_enabled ?? true;
+const AUDIT_SENSITIVE_ENABLED = () => GET_KIT_SECRETS().emails.audit_sensitive_enabled ?? true;
+const SENDER_EMAIL = () => GET_KIT_SECRETS().emails.sender;
+const SEND_EMAIL_COPY = () => GET_KIT_SECRETS().emails.send_email_to_support;
+const API_NAME = () => GET_KIT_CONFIG().api_name;
+const SUPPORT_SOURCE = () => `'${API_NAME()} Support <${SENDER_EMAIL()}>'`;
+
+const SENSITIVE_BCC_MAILTYPES = new Set([
+	MAILTYPE.WITHDRAWAL_REQUEST,
+	MAILTYPE.RESET_PASSWORD,
+	MAILTYPE.RESET_PASSWORD_CODE,
+	MAILTYPE.CHANGE_PASSWORD,
+	MAILTYPE.CHANGE_PASSWORD_CODE
+]);
+
+const BCC_ADDRESSES = (type) => {
+	if (!SEND_EMAIL_COPY()) return [];
+
+	if (SENSITIVE_BCC_MAILTYPES.has(type)) {
+		if (AUDIT_SENSITIVE_ENABLED() && SENSITIVE_AUDIT_EMAIL()) return [SENSITIVE_AUDIT_EMAIL()];
+		return [];
+	}
+
+	if (AUDIT_ENABLED() && AUDIT_EMAIL()) return [AUDIT_EMAIL()];
+	return [];
+};
+const SMTP_SERVER = () => GET_KIT_SECRETS().smtp.server;
+const SMTP_USER = () => GET_KIT_SECRETS().smtp.user;
+
+const DEFAULT_LANGUAGE = () => {
+	try {
+		return GET_KIT_CONFIG().defaults.language;
+	} catch (err) {
+		return 'en';
+	}
+};
+
+const sendEmail = (
+	type,
+	receiver,
+	data,
+	{ language = DEFAULT_LANGUAGE() },
+	domain = DOMAIN
+) => {
+	language = getValidLanguage(language);
+	let from = SUPPORT_SOURCE();
+	let to = {
+		ToAddresses: [receiver]
+	};
+	switch (type) {
+		case MAILTYPE.WELCOME: {
+			break;
+		}
+		case MAILTYPE.LOGIN: {
+			if (data.time) data.time = formatDate(data.time, language);
+			if (data.ip && !data.country) data.country = getCountryFromIp(data.ip, data.headers);
+			break;
+		}
+		case MAILTYPE.SIGNUP:
+		case MAILTYPE.RESET_PASSWORD:
+		case MAILTYPE.CHANGE_PASSWORD:
+		case MAILTYPE.CHANGE_PASSWORD_CODE:
+		case MAILTYPE.PASSWORD_CHANGED:
+		case MAILTYPE.USER_VERIFICATION_REJECT:
+		case MAILTYPE.ACCOUNT_UPGRADE:
+		case MAILTYPE.ACCOUNT_VERIFY:
+		case MAILTYPE.INVALID_ADDRESS:
+		case MAILTYPE.USER_DEACTIVATED:
+		case MAILTYPE.INVITED_OPERATOR:
+		case MAILTYPE.DISCOUNT_UPDATE:
+		case MAILTYPE.WITHDRAWAL_REQUEST:
+		case MAILTYPE.BANK_VERIFIED:
+		case MAILTYPE.CONFIRM_EMAIL:
+		case MAILTYPE.LOCKED_ACCOUNT:
+		case MAILTYPE.SUSPICIOUS_LOGIN:
+		case MAILTYPE.SUSPICIOUS_LOGIN_CODE:
+		case MAILTYPE.WITHDRAWAL_REQUEST_CODE:
+		case MAILTYPE.ADDRESSBOOK_WHITELIST_REQUEST:
+		case MAILTYPE.RESET_PASSWORD_CODE:
+		case MAILTYPE.SIGNUP_CODE:
+		case MAILTYPE.SET_EMAIL_CODE:
+		case MAILTYPE.USER_DELETED:
+		case MAILTYPE.DEPOSIT:
+		case MAILTYPE.WITHDRAWAL:
+		case MAILTYPE.P2P_MERCHANT_IN_PROGRESS:
+		case MAILTYPE.P2P_BUYER_PAID_ORDER:
+		case MAILTYPE.P2P_ORDER_EXPIRED:
+		case MAILTYPE.P2P_BUYER_CANCELLED_ORDER:
+		case MAILTYPE.P2P_BUYER_APPEALED_ORDER:
+		case MAILTYPE.P2P_VENDOR_CONFIRMED_ORDER:
+		case MAILTYPE.P2P_VENDOR_CANCELLED_ORDER:
+		case MAILTYPE.P2P_VENDOR_APPEALED_ORDER:
+		case MAILTYPE.AUTO_TRADE_ERROR:
+		case MAILTYPE.AUTO_TRADE_FILLED:
+		case MAILTYPE.AUTO_TRADE_REMINDER:
+		case MAILTYPE.DOC_REJECTED:
+		case MAILTYPE.DOC_VERIFIED:
+		case MAILTYPE.STAKE_CREATED:
+		case MAILTYPE.STAKE_SETTLED:
+		case MAILTYPE.SUBACCOUNT_REMOVED: {
+			to.BccAddresses = BCC_ADDRESSES(type);
+			break;
+		}
+		case MAILTYPE.DEPOSIT_CANCEL: {
+			if (data.date) data.date = formatDate(data.date);
+			to.BccAddresses = BCC_ADDRESSES(type);
+			break;
+		}
+		case MAILTYPE.ALERT:
+		case MAILTYPE.SUSPICIOUS_DEPOSIT:
+		case MAILTYPE.USER_VERIFICATION:
+		case MAILTYPE.CONTACT_FORM: {
+			// Prefer sensitive audit inbox for these high-signal operational emails
+			to.ToAddresses = [SENSITIVE_AUDIT_EMAIL()];
+			break;
+		}
+		case MAILTYPE.OTP_DISABLED:
+		case MAILTYPE.OTP_ENABLED: {
+			if (data.time) data.time = formatDate(data.time, language);
+			if (data.ip && !data.country) data.country = getCountryFromIp(data.ip, data.headers);
+			to.BccAddresses = BCC_ADDRESSES(type);
+			break;
+		}
+		default:
+			return;
+	}
+
+	// Central deliverability guard: drop undeliverable recipients before
+	// hitting SMTP. Phone-signup ("sms") users have a synthetic, intentionally
+	// invalid email (`<digits>_sms`, no @), so isEmail() filters them out here
+	// and they no longer receive dead activity notifications (2FA, deposits,
+	// etc). Audit-routed mail types override ToAddresses with the audit inbox,
+	// so those are unaffected.
+	// require_tld:false keeps internal/no-TLD relay addresses (e.g. admin@exir)
+	// deliverable; the synthetic phone-signup email has no @ so it is rejected
+	// regardless.
+	const isDeliverable = (address) => isEmail(String(address || '').trim(), { require_tld: false });
+	to.ToAddresses = (to.ToAddresses || []).filter(isDeliverable);
+	if (to.BccAddresses) {
+		to.BccAddresses = to.BccAddresses.filter(isDeliverable);
+	}
+	if (to.ToAddresses.length === 0) {
+		loggerEmail.info('mail/sendEmail skipping send to undeliverable recipient', type, receiver);
+		return;
+	}
+
+	const messageContent = generateMessageContent(
+		type,
+		receiver,
+		data,
+		language,
+		domain
+	);
+	const payload = payloadTemplate(from, to, messageContent);
+	return send(payload);
+};
+
+const sendRawEmail = (
+	receivers,
+	title,
+	html,
+	text
+) => {
+	let from = SUPPORT_SOURCE();
+
+	const payload = {
+		from,
+		to: receivers,
+		subject: `${API_NAME()} ${title || ''}`,
+		html,
+		text: text || ''
+	};
+
+	return send(payload);
+};
+
+const send = (params) => {
+	if (SMTP_SERVER() && SMTP_USER() && SMTP_SERVER().length > 1) {
+		return sendSMTPEmail(params)
+			.then((info) => {
+				return info;
+			})
+			.catch((error) => {
+				loggerEmail.error('mail/index/sendSTMPEmail', error);
+			});
+	}
+};
+
+const testSendSMTPEmail = (receiver = '', smtp = {}) => {
+	const to = { ToAddresses: [receiver] };
+	const messageContent = {
+		'subject': 'Test Email Config SMTP',
+		'html': '<div><p>Test email is sent successfully</p></div>',
+		'text': 'test content'
+	};
+	let from = SUPPORT_SOURCE();
+
+	if (Object.keys(smtp).length > 0) {
+		from = `'SMTP User <${smtp.user}>'`;
+	}
+
+	const payload = payloadTemplate(from, to, messageContent);
+
+	return sendSMTPTestEmail(payload, smtp);
+};
+
+module.exports = {
+	sendEmail,
+	testSendSMTPEmail,
+	sendRawEmail
+};

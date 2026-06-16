@@ -1,0 +1,26 @@
+.select-box {
+	.ant-select-selector {
+		background-color: #202980 !important;
+		color: #fff;
+	}
+	.ant-select-arrow {
+		color: #fff;
+	}
+}
+
+.date-box {
+	.ant-picker-input > input {
+		color: #fff !important;
+	}
+}
+
+.admin-session-table {
+	tr.ant-table-expanded-row {
+		> td {
+			background: var(--admin_panel_table_tbody) !important;
+		}
+		&:hover > td {
+			background: var(--admin_panel_table_tbody) !important;
+		}
+	}
+}

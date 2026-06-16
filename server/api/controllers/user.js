@@ -1,0 +1,3254 @@
+'use strict';
+
+const { isEmail, isUUID, isMobilePhone } = require('validator');
+const toolsLib = require('hollaex-tools-lib');
+const crypto = require('crypto');
+const { sendEmail } = require('../../mail');
+const { MAILTYPE } = require('../../mail/strings');
+const { loggerUser } = require('../../config/logger');
+const { errorMessageConverter } = require('../../utils/conversion');
+const randomString = require('random-string');
+const {
+	USER_VERIFIED,
+	PROVIDE_VALID_EMAIL_CODE,
+	USER_REGISTERED,
+	USER_NOT_FOUND,
+	USER_EMAIL_NOT_VERIFIED,
+	USER_PHONE_NOT_VERIFIED,
+	VERIFICATION_EMAIL_MESSAGE,
+	TOKEN_REMOVED,
+	INVALID_CREDENTIALS,
+	USER_NOT_VERIFIED,
+	USER_NOT_ACTIVATED,
+	SIGNUP_NOT_AVAILABLE,
+	PROVIDE_VALID_EMAIL,
+	INVALID_PASSWORD,
+	USER_EXISTS,
+	VERIFICATION_CODE_EXPIRED,
+	INVALID_VERIFICATION_CODE,
+	LOGIN_NOT_ALLOW,
+	NO_IP_FOUND,
+	INVALID_OTP_CODE,
+	OTP_CODE_NOT_FOUND,
+	INVALID_CAPTCHA,
+	RESET_PASSWORD_REQUEST_SENT_IF_USER_EXISTS,
+	GOOGLE_ACCOUNT_MISMATCH,
+	SERVICE_NOT_AVAILABLE,
+	SUBACCOUNT_CANNOT_GENERATE_ADDRESS,
+	PASSWORD_SET,
+	PASSWORD_NOT_SET,
+	USER_REGISTERED_EMAIL_CODE,
+	USER_REGISTERED_SMS_CODE,
+	SIGNUP_EMAIL_OR_PHONE_NOT_BOTH,
+	PROVIDE_VALID_PHONE,
+	REFERRAL_CONNECT_FAILED
+} = require('../../messages');
+const { DEFAULT_ORDER_RISK_PERCENTAGE, EVENTS_CHANNEL, API_HOST, DOMAIN, TOKEN_TIME_NORMAL, TOKEN_TIME_LONG, HOLLAEX_NETWORK_BASE_URL, NUMBER_OF_ALLOWED_ATTEMPTS, GET_KIT_SECRETS } = require('../../constants');
+const { all } = require('bluebird');
+const { each, isInteger, isArray } = require('lodash');
+const { publisher } = require('../../db/pubsub');
+const { isDate } = require('moment');
+const moment = require('moment');
+const DeviceDetector = require('node-device-detector');
+const uuid = require('uuid/v4');
+const SMTP_SERVER = () => GET_KIT_SECRETS()?.smtp?.server;
+
+const VERIFY_STATUS = {
+	EMPTY: 0,
+	PENDING: 1,
+	REJECTED: 2,
+	COMPLETED: 3
+};
+
+const detector = new DeviceDetector({
+	clientIndexes: true,
+	deviceIndexes: true,
+	deviceAliasCode: false,
+});
+
+
+const INITIAL_SETTINGS = () => {
+	return {
+		notification: {
+			popup_order_confirmation: true,
+			popup_order_completed: true,
+			popup_order_partially_filled: true,
+			popup_order_new: true,
+			popup_order_canceled: true
+		},
+		interface: {
+			order_book_levels: 10,
+			theme: toolsLib.getKitConfig().defaults.theme,
+			date_format: 'MM/DD/YYYY',
+			time_format: '12h'
+		},
+		language: toolsLib.getKitConfig().defaults.language,
+		audio: {
+			order_completed: true,
+			order_partially_completed: true,
+			public_trade: false
+		},
+		risk: {
+			order_portfolio_percentage: DEFAULT_ORDER_RISK_PERCENTAGE
+		},
+		chat: {
+			set_username: false
+		},
+		watchlist: []
+	};
+};
+
+// Shared verification/auth code generator. Keeps email/SMS/passkey flows
+// consistent so that v3/v4 always produce a short human-friendly code
+// (the SUSPICIOUS_LOGIN_CODE / SIGNUP_CODE templates render the value
+// directly to the user). For older clients we fall back to a UUID for
+// signup/verify flows and a base64 token for suspicious-login flows.
+const generateAuthCode = (version, { fallback = 'uuid' } = {}) => {
+	if (version === 'v4') {
+		return crypto.randomInt(100000, 1000000).toString();
+	}
+	if (version === 'v3') {
+		const letters = Array.from({ length: 2 }, () =>
+			String.fromCharCode(65 + crypto.randomInt(0, 26))
+		).join('');
+		const numbers = crypto.randomInt(10000, 100000);
+		return `${letters}-${numbers}`;
+	}
+	if (fallback === 'token') {
+		return crypto
+			.randomBytes(9)
+			.toString('base64')
+			.replace(/[^a-zA-Z0-9]/g, '')
+			.substring(0, 12);
+	}
+	return uuid();
+};
+
+
+const signUpUser = (req, res) => {
+	const {
+		password,
+		captcha,
+		referral,
+		phone_number: phoneNumberRaw,
+		verification_method
+	} = req.swagger.params.signup.value;
+
+	let { email, version } = req.swagger.params.signup.value;
+	const ip = req.headers['x-real-ip'];
+	loggerUser.debug(
+		req.uuid,
+		'controllers/user/signUpUser',
+		req.swagger.params.signup.value,
+		ip
+	);
+
+	const phone_number =
+		phoneNumberRaw != null && String(phoneNumberRaw).trim().length > 0
+			? String(phoneNumberRaw).trim()
+			: undefined;
+	const emailTrim =
+		email != null && String(email).trim().length > 0
+			? String(email).trim().toLowerCase()
+			: undefined;
+
+	if (phone_number && emailTrim) {
+		const messageObj = errorMessageConverter(
+			{ message: SIGNUP_EMAIL_OR_PHONE_NOT_BOTH },
+			req?.auth?.sub?.lang
+		);
+		return res.status(400).json({
+			message: messageObj?.message,
+			lang: messageObj?.lang,
+			code: messageObj?.code
+		});
+	}
+	if (!phone_number && !emailTrim) {
+		const messageObj = errorMessageConverter(
+			{ message: PROVIDE_VALID_EMAIL },
+			req?.auth?.sub?.lang
+		);
+		return res.status(400).json({
+			message: messageObj?.message,
+			lang: messageObj?.lang,
+			code: messageObj?.code
+		});
+	}
+
+	const signupEmail = emailTrim || null;
+
+	toolsLib.security.checkIp(ip, req.headers)
+		.then(() => {
+			return toolsLib.security.checkCaptcha(captcha, ip, req.headers);
+		})
+		.then(() =>
+			toolsLib.user.signUpUser(
+				signupEmail,
+				password,
+				{ referral, phone_number, verification_method },
+				version
+			)
+		)
+		.then(() => {
+			const requiresVerification = toolsLib.getKitConfig().email_verification_required;
+			let successMessage = USER_REGISTERED;
+			if (requiresVerification) {
+				successMessage = phone_number
+					? USER_REGISTERED_SMS_CODE
+					: USER_REGISTERED_EMAIL_CODE;
+			}
+			const messageObj = errorMessageConverter({ message: successMessage }, req?.auth?.sub?.lang);
+			return res.status(201).json({
+				message: messageObj?.message,
+				lang: messageObj?.lang,
+				code: messageObj?.code
+			});
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/signUpUser', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+// Google OAuth signup function
+const signUpUserWithGoogle = async (req, res) => {
+	const { google_token, referral } = req.swagger.params.signup.value;
+	const ip = req.headers['x-real-ip'];
+
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/signUpUserWithGoogle',
+		{ google_token: !!google_token, referral },
+		ip
+	);
+
+	try {
+		// Enforce kit configuration: only allow when google_oauth configured
+		const googleOAuthConfig = toolsLib?.getKitConfig?.()?.google_oauth?.client_id;
+		if (!googleOAuthConfig || (typeof googleOAuthConfig === 'string' && googleOAuthConfig.length === 0)) {
+			throw new Error(SERVICE_NOT_AVAILABLE);
+		}
+
+		// Geo/IP check (enforce same blocking as email login)
+		await toolsLib.security.checkIp(ip, req.headers);
+
+		// Verify Google token and get user data
+		const googleUserData = await toolsLib.user.verifyGoogleToken(google_token);
+		const email = googleUserData.email.toLowerCase().trim();
+
+		// Check if user already exists
+		const existingUser = await toolsLib.user.getUserByEmail(email, false);
+		if (existingUser) {
+			throw new Error('User already exists');
+		}
+
+		// Generate a random password for Google OAuth users
+		const randomPassword = crypto.randomBytes(16).toString('hex');
+
+		// Create user with Google data
+		const userData = {
+			email,
+			password: randomPassword,
+			referral,
+			google_id: googleUserData.google_id || googleUserData.sub,
+			name: googleUserData.name,
+			email_verified: false,
+			activated: true
+		};
+
+		await toolsLib.user.signUpUser(email, randomPassword, userData);
+
+		res.status(201).json({ 
+			message: USER_REGISTERED,
+			oauth_signup: true
+		});
+
+	} catch (err) {
+		loggerUser.error(req.uuid, 'controllers/user/signUpUserWithGoogle', err.message);
+		const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+		return res.status(err.statusCode || 400).json({ 
+			message: messageObj?.message, 
+			lang: messageObj?.lang, 
+			code: messageObj?.code 
+		});
+	}
+};
+
+const getVerifyUser = (req, res) => {
+	let email = req.swagger.params.email.value;
+	const phoneNumberRaw = req.swagger.params.phone_number && req.swagger.params.phone_number.value;
+	const resendEmail = req.swagger.params.resend.value;
+	const version = req.swagger.params.version && req.swagger.params.version.value;
+	const verification_method = req.swagger.params.verification_method
+		&& req.swagger.params.verification_method.value;
+	const domain = req.headers['x-real-origin'];
+	const ip = req.headers['x-real-ip'];
+	const captcha = req.swagger.params.captcha && req.swagger.params.captcha.value;
+	let promiseQuery;
+
+	const generateCode = () => generateAuthCode(version);
+
+	if (phoneNumberRaw && typeof phoneNumberRaw === 'string' && isMobilePhone(phoneNumberRaw.trim(), 'any', { strictMode: true })) {
+		promiseQuery = toolsLib.user.getUserByPhoneNumber(phoneNumberRaw.trim(), false)
+			.then(async (user) => {
+				if (!user) {
+					throw new Error(USER_NOT_FOUND);
+				}
+				if (user.phone_number_verified) {
+					throw new Error(USER_VERIFIED);
+				}
+				if (resendEmail) {
+					await toolsLib.security.checkCaptcha(captcha, ip, req.headers);
+					const verificationCode = generateCode();
+					toolsLib.user.storeVerificationCode(user, verificationCode);
+					await toolsLib.verification.sendVerificationCode(user, {
+						action_type: 'signup',
+						verification_code: verificationCode,
+						emailType: version === 'v3' || version === 'v4' ? MAILTYPE.SIGNUP_CODE : MAILTYPE.SIGNUP,
+						requestVerificationMethod: verification_method,
+						domain
+					});
+				}
+				return res.json({
+					phone_number: user.phone_number,
+					message: VERIFICATION_EMAIL_MESSAGE
+				});
+			});
+	} else if (email && typeof email === 'string' && isEmail(email)) {
+		email = email.toLowerCase();
+		promiseQuery = toolsLib.database.findOne('user', {
+			where: { email },
+			attributes: ['id', 'email', 'email_verified', 'phone_number', 'settings', 'meta']
+		}).then(async (user) => {
+			if (!user) {
+				throw new Error(USER_NOT_FOUND);
+			}
+			if (user.email_verified) {
+				throw new Error(USER_VERIFIED);
+			}
+			if (resendEmail) {
+				// Validate captcha before resending verification email to reduce spam/bot abuse.
+				await toolsLib.security.checkCaptcha(captcha, ip, req.headers);
+				const verificationCode = generateCode();
+				toolsLib.user.storeVerificationCode(user, verificationCode);
+
+				const phoneSignup = toolsLib.user.isPhoneSignupSyntheticUser(user);
+				if (phoneSignup && user.phone_number) {
+					await toolsLib.verification.sendVerificationCode(user, {
+						action_type: 'signup',
+						verification_code: verificationCode,
+						emailType: version === 'v3' || version === 'v4' ? MAILTYPE.SIGNUP_CODE : MAILTYPE.SIGNUP,
+						requestVerificationMethod: verification_method,
+						domain
+					});
+				} else {
+					sendEmail(
+						version === 'v3' || version === 'v4' ? MAILTYPE.SIGNUP_CODE : MAILTYPE.SIGNUP,
+						email,
+						verificationCode,
+						{},
+						domain
+					);
+				}
+			}
+			return res.json({
+				email,
+				message: VERIFICATION_EMAIL_MESSAGE
+			});
+		});
+	} else {
+		return res.status(400).json({
+			message: PROVIDE_VALID_EMAIL_CODE
+		});
+	}
+
+	promiseQuery
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/getVerifyUser catch', err.message);
+			// Obfuscate most errors to avoid leaking whether a user/email exists.
+			// Exception: surface captcha failures so the client can prompt a new challenge.
+			if (err?.message === INVALID_CAPTCHA) {
+				const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+				return res.status(err.statusCode || 400).json({
+					message: messageObj?.message,
+					lang: messageObj?.lang,
+					code: messageObj?.code
+				});
+			}
+
+			const messageObj = errorMessageConverter({ message: VERIFICATION_EMAIL_MESSAGE }, req?.auth?.sub?.lang);
+			return res.status(200).json({
+				message: messageObj?.message,
+				lang: messageObj?.lang,
+				code: messageObj?.code
+			});
+		});
+};
+
+const requestUserSetEmail = (req, res) => {
+	const { email } = req.swagger.params.data.value;
+	const domain = req.headers['x-real-origin'];
+	const userId = req.auth.sub.id;
+
+	toolsLib.user.requestUserSetEmail(userId, email, domain)
+		.then((result) => {
+			const messageObj = errorMessageConverter(
+				{ message: result.message },
+				req?.auth?.sub?.lang
+			);
+			return res.json({
+				message: messageObj?.message,
+				lang: messageObj?.lang,
+				code: messageObj?.code
+			});
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/requestUserSetEmail', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({
+				message: messageObj?.message,
+				lang: messageObj?.lang,
+				code: messageObj?.code
+			});
+		});
+};
+
+const confirmUserSetEmail = (req, res) => {
+	const { code } = req.swagger.params.data.value;
+	const userId = req.auth.sub.id;
+
+	toolsLib.user.confirmUserSetEmail(userId, code)
+		.then((user) => {
+			return res.json(user);
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/confirmUserSetEmail', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({
+				message: messageObj?.message,
+				lang: messageObj?.lang,
+				code: messageObj?.code
+			});
+		});
+};
+
+const verifyUser = (req, res) => {
+	const { verification_code, email, phone_number: phoneNumberRaw } = req.swagger.params.data.value;
+	const domain = req.headers['x-real-origin'];
+	const ip = req.headers['x-real-ip'];
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/verifyUser',
+		{ verification_code, email, phone_number: phoneNumberRaw },
+		ip
+	);
+
+	let resolveEmail;
+	if (phoneNumberRaw && typeof phoneNumberRaw === 'string' && isMobilePhone(phoneNumberRaw.trim(), 'any', { strictMode: true })) {
+		// Phone-signup users don't know their synthetic email — look it up by phone number.
+		resolveEmail = toolsLib.user.getUserByPhoneNumber(phoneNumberRaw.trim())
+			.then((user) => {
+				if (!user) throw new Error(USER_NOT_FOUND);
+				return user.email;
+			});
+	} else if (email) {
+		resolveEmail = Promise.resolve(email);
+	} else {
+		const messageObj = errorMessageConverter({ message: PROVIDE_VALID_EMAIL_CODE }, req?.auth?.sub?.lang);
+		return res.status(400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+	}
+
+	resolveEmail
+		.then((resolvedEmail) => toolsLib.user.verifyUser(resolvedEmail, verification_code, domain))
+		.then(() => {
+			return res.json({ message: USER_VERIFIED });
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/verifyUser', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+
+
+const createAttemptMessage = (loginData, user, domain) => {
+	const currentNumberOfAttemps = NUMBER_OF_ALLOWED_ATTEMPTS - loginData.attempt;
+	if (currentNumberOfAttemps === NUMBER_OF_ALLOWED_ATTEMPTS - 1) { return ''; }
+	else if (currentNumberOfAttemps === 0) {
+		sendEmail(
+			MAILTYPE.LOCKED_ACCOUNT,
+			user.email,
+			{},
+			user.settings,
+			domain);
+
+		return ' ' + LOGIN_NOT_ALLOW;
+	}
+	return ` You have ${currentNumberOfAttemps} more ${currentNumberOfAttemps === 1 ? 'attempt' : 'attempts'} left`;
+};
+
+const loginPost = async (req, res) => {
+	const {
+		password,
+		otp_code,
+		captcha,
+		service,
+		long_term,
+		version,
+		verification_method
+	} = req.swagger.params.authentication.value;
+	let {
+		email,
+		phone_number
+	} = req.swagger.params.authentication.value;
+
+	const ip = req.headers['x-real-ip'];
+	let device;
+
+	if (req.headers['custom-device']) {
+		device = req.headers['user-agent'];
+	} else {
+		const userAgent = req.headers['user-agent'];
+		const result = detector.detect(userAgent);
+
+		const truncate = (str, maxLen = 100) => {
+			if (!str || typeof str !== 'string') return '';
+			return str.substring(0, maxLen);
+		};
+
+		let deviceParts = [
+			truncate(result.device.brand, 100),
+			truncate(result.device.model, 100),
+			truncate(result.device.type, 100),
+			truncate(result.client.name, 100),
+			truncate(result.client.type, 100),
+			truncate(result.os.name, 100)
+		].filter(Boolean);
+
+		device = deviceParts.join(' ').trim();
+
+		const encoder = new TextEncoder();
+		while (encoder.encode(device).length > 1000 && deviceParts.length > 1) {
+			deviceParts.pop();
+			device = deviceParts.join(' ').trim();
+		}
+	}
+
+	const domain = req.headers['x-real-origin'];
+	const origin = req.headers.origin;
+	const referer = req.headers.referer;
+	const time = new Date();
+
+	// Mask short-lived secrets in the access log: keep just the last 10 chars
+	// of the captcha token so we can correlate Cloudflare audit logs without
+	// exposing a still-valid Turnstile token via log shipping/aggregation.
+	// `otp_code` is logged as a presence flag for the same reason.
+	const maskTail = (s, n = 10) => {
+		const v = String(s || '');
+		if (!v) return '';
+		return v.length <= n ? v : `…${v.slice(-n)}`;
+	};
+
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/loginPost',
+		'email',
+		email,
+		'phone_number',
+		phone_number,
+		'otp_code',
+		!!otp_code,
+		'captcha',
+		maskTail(captcha),
+		'service',
+		service,
+		'long_term',
+		long_term,
+		'ip',
+		ip,
+		'device',
+		device,
+		'domain',
+		domain,
+		'origin',
+		origin,
+		'referer',
+		referer
+	);
+
+	if (!email && !phone_number) {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/loginPost missing email or phone_number'
+		);
+		return res.status(400).json({ message: 'Email or phone number is required' });
+	}
+
+	if (email && (typeof email !== 'string' || !isEmail(email))) {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/loginPost invalid email',
+			email
+		);
+		return res.status(400).json({ message: 'Invalid Email' });
+	}
+
+	if (phone_number && (typeof phone_number !== 'string' || !isMobilePhone(phone_number, 'any', { strictMode: true }))) {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/loginPost invalid phone_number',
+			phone_number
+		);
+		return res.status(400).json({ message: 'Invalid phone number' });
+	}
+
+	if (email) {
+		email = email.toLowerCase().trim();
+	}
+	if (phone_number) {
+		phone_number = phone_number.trim();
+	}
+
+	try {
+		await toolsLib.security.checkIp(ip, req.headers);
+		loggerUser.verbose(
+			req.uuid,
+			'controllers/user/loginPost checkIp passed',
+			ip
+		);
+
+		// Captcha is the very first gate, before any account lookup. Without
+		// this, the subsequent USER_NOT_FOUND / USER_NOT_VERIFIED /
+		// USER_NOT_ACTIVATED / LOGIN_NOT_ALLOW branches let an unauthenticated
+		// attacker enumerate accounts and account states without solving a
+		// single Turnstile challenge.
+		await toolsLib.security.checkCaptcha(captcha, ip, req.headers);
+		loggerUser.verbose(
+			req.uuid,
+			'controllers/user/loginPost checkCaptcha passed'
+		);
+
+		const isPhoneLogin = !email && !!phone_number;
+		const user = email
+			? await toolsLib.user.getUserByEmail(email)
+			: await toolsLib.user.getUserByPhoneNumber(phone_number);
+
+		if (!user) {
+			throw new Error(USER_NOT_FOUND);
+		}
+		if (!ip) {
+			throw new Error(NO_IP_FOUND);
+		}
+		if (user.verification_level === 0) {
+			throw new Error(USER_NOT_VERIFIED);
+		} else if (toolsLib.getKitConfig().email_verification_required) {
+			if (isPhoneLogin) {
+				if (!user.phone_number_verified) {
+					throw new Error(USER_PHONE_NOT_VERIFIED);
+				}
+			} else if (!user.email_verified) {
+				throw new Error(USER_EMAIL_NOT_VERIFIED);
+			}
+		}
+		if (!user.activated) {
+			throw new Error(USER_NOT_ACTIVATED);
+		}
+
+		const latestLogin = await toolsLib.user.findUserLatestLogin(user, false);
+		// Use `>=` (not `===`). Combined with the atomic capped increment in
+		// `updateLoginAttempt`, this is robust against concurrent requests
+		// that would previously race past the cap and bypass the lockout.
+		if (
+			latestLogin &&
+			latestLogin.attempt >= NUMBER_OF_ALLOWED_ATTEMPTS &&
+			latestLogin.status == false
+		) {
+			throw new Error(LOGIN_NOT_ALLOW);
+		}
+
+		// Captcha was already validated above (before any account lookup).
+		// The remaining gates run in this order: password -> OTP. We
+		// deliberately surface "incorrect credentials" before asking for the
+		// OTP code so users who mistyped their password don't get pushed
+		// into a 2FA dialog that can never succeed. The trade-off (an
+		// attacker with a correct password but no OTP learns the password
+		// is right) is acceptable because Turnstile, the per-account rate
+		// limit, and the failed-attempt lockout all still gate the request.
+
+		// Password.
+		if (user.password === 'notset') {
+			throw new Error(PASSWORD_NOT_SET);
+		}
+
+		const passwordIsValid = await toolsLib.security.validatePassword(
+			user.password,
+			password
+		);
+
+		if (!passwordIsValid) {
+			loggerUser.verbose(
+				req.uuid,
+				'controllers/user/loginPost password not passed'
+			);
+			await toolsLib.user.createUserLogin(
+				user,
+				ip,
+				device,
+				domain,
+				origin,
+				referer,
+				null,
+				long_term,
+				false,
+				req.headers
+			);
+			const loginData = await toolsLib.user.findUserLatestLogin(user, false);
+			const message = createAttemptMessage(loginData, user, domain);
+			throw new Error(INVALID_CREDENTIALS + message);
+		}
+
+		loggerUser.verbose(
+			req.uuid,
+			'controllers/user/loginPost password passed'
+		);
+
+		// OTP. A missing OTP code is *not* counted as a failed login (the
+		// credentials were correct, the user just hasn't typed their code
+		// yet); the frontend opens the OTP dialog on this error and
+		// re-submits with a fresh captcha token + the OTP code. A wrong OTP
+		// IS counted toward the failed-attempt lockout.
+		if (user.otp_enabled) {
+			if (!otp_code) {
+				throw new Error(INVALID_OTP_CODE);
+			}
+			try {
+				await toolsLib.security.verifyOtpBeforeAction(user.id, otp_code);
+				loggerUser.verbose(
+					req.uuid,
+					'controllers/user/loginPost otp passed'
+				);
+			} catch (err) {
+				await toolsLib.user.createUserLogin(
+					user,
+					ip,
+					device,
+					domain,
+					origin,
+					referer,
+					null,
+					long_term,
+					false,
+					req.headers
+				);
+				const loginData = await toolsLib.user.findUserLatestLogin(user, false);
+				const message = createAttemptMessage(loginData, user, domain);
+				throw new Error((err?.message || INVALID_OTP_CODE) + message);
+			}
+		}
+
+		const lastLogins = await toolsLib.user.findUserLastLogins(user);
+		const successfulRecords = (lastLogins || []).filter((login) => login.status);
+
+		const country = toolsLib.security.getCountryFromIp(ip, req.headers);
+
+		const suspiciousLoginEnabled = toolsLib?.getKitConfig()?.suspicious_login?.active;
+		let suspiciousLogin = false;
+		// Only compute/log suspicious login detection when the feature is enabled (and actionable).
+		if (suspiciousLoginEnabled && SMTP_SERVER()?.length > 0) {
+			if (
+				isArray(lastLogins) &&
+				lastLogins.length > 0 &&
+				!successfulRecords?.find((login) => login.country === country)
+			) {
+				loggerUser.verbose(
+					req.uuid,
+					'controllers/user/loginPost suspicious login detected',
+					'user id',
+					user.id,
+					'country',
+					country,
+					'login records length',
+					lastLogins.length,
+					'successful records length',
+					successfulRecords.length
+				);
+				suspiciousLogin = true;
+			}
+		}
+
+		if (suspiciousLoginEnabled && suspiciousLogin && SMTP_SERVER()?.length > 0) {
+			const verification_code = generateAuthCode(version, { fallback: 'token' });
+
+			const loginData = await toolsLib.user.createSuspiciousLogin(
+				user,
+				ip,
+				device,
+				country,
+				domain,
+				origin,
+				referer,
+				null,
+				long_term
+			);
+
+			const data = {
+				id: loginData.id,
+				email: user.email,
+				verification_code,
+				ip,
+				time,
+				device,
+				country,
+				user_id: user.id,
+			};
+
+			await toolsLib.database.client.setexAsync(
+				`user:confirm-login:${verification_code}`,
+				5 * 60,
+				JSON.stringify(data)
+			);
+			await toolsLib.database.client.setexAsync(
+				`user:freeze-account:${verification_code}`,
+				60 * 60 * 6,
+				JSON.stringify(data)
+			);
+
+			await toolsLib.verification.sendVerificationCode(user, {
+				action_type: 'login_verification',
+				verification_code,
+				emailType: version === 'v3' || version === 'v4'
+					? MAILTYPE.SUSPICIOUS_LOGIN_CODE
+					: MAILTYPE.SUSPICIOUS_LOGIN,
+				emailData: data,
+				requestVerificationMethod: verification_method,
+				domain
+			});
+			throw new Error('Suspicious login detected, please check your email.');
+		}
+
+		const emailData = {
+			ip,
+			time,
+			device,
+			country,
+		};
+
+		publisher.publish(
+			EVENTS_CHANNEL,
+			JSON.stringify({
+				type: 'user',
+				data: {
+					action: 'login',
+					user_id: user.id,
+				},
+			})
+		);
+
+		if (!service && isEmail(user.email)) {
+			sendEmail(MAILTYPE.LOGIN, user.email, emailData, user.settings, domain);
+		}
+
+		let userRole;
+		if (user.role) {
+			const roles = toolsLib.getRoles();
+			userRole = roles.find((role) => role.role_name === user.role);
+		}
+		loggerUser.verbose(
+			req.uuid,
+			'controllers/user/loginPost user role',
+			user.role,
+			'user role name',
+			userRole?.role_name
+		);
+
+		const token = await toolsLib.security.issueToken(
+			user.id,
+			user.network_id,
+			user.email,
+			ip,
+			long_term ? TOKEN_TIME_LONG : TOKEN_TIME_NORMAL,
+			user.settings.language,
+			userRole?.permissions,
+			userRole?.configs,
+			user.role
+		);
+		loggerUser.verbose(
+			req.uuid,
+			'controllers/user/loginPost token issues successfully'
+		);
+
+		await toolsLib.user.createUserLogin(
+			user,
+			ip,
+			device,
+			domain,
+			origin,
+			referer,
+			token,
+			long_term,
+			true,
+			req.headers
+		);
+
+		return res.status(201).json({ token });
+	} catch (err) {
+		loggerUser.error(req.uuid, 'controllers/user/loginPost catch', err.message);
+		const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+		return res
+			.status(err.statusCode || 401)
+			.json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+	}
+};
+
+// Google OAuth login function. Mirrors `loginPost` in terms of security
+// gates: captcha first, OTP if the user has it enabled, suspicious-login
+// geo confirmation if configured, and the same `>=` lockout check. The
+// only thing we don't run is the password check (Google id_token replaces it).
+const loginWithGoogle = async (req, res) => {
+	const {
+		google_token,
+		service,
+		long_term,
+		version,
+		captcha,
+		otp_code,
+		verification_method
+	} = req.swagger.params.authentication.value;
+	const ip = req.headers['x-real-ip'];
+	const domain = req.headers['x-real-origin'];
+	const origin = req.headers.origin;
+	const referer = req.headers.referer;
+	const time = new Date();
+
+	let device;
+	if (req.headers['custom-device']) {
+		device = req.headers['user-agent'];
+	} else {
+		const userAgent = req.headers['user-agent'];
+		const result = detector.detect(userAgent);
+
+		const truncate = (str, maxLen = 100) => {
+			if (!str || typeof str !== 'string') return '';
+			return str.substring(0, maxLen);
+		};
+
+		let deviceParts = [
+			truncate(result.device.brand, 100),
+			truncate(result.device.model, 100),
+			truncate(result.device.type, 100),
+			truncate(result.client.name, 100),
+			truncate(result.client.type, 100),
+			truncate(result.os.name, 100)
+		].filter(Boolean);
+
+		device = deviceParts.join(' ').trim();
+
+		const encoder = new TextEncoder();
+		while (encoder.encode(device).length > 1000 && deviceParts.length > 1) {
+			deviceParts.pop();
+			device = deviceParts.join(' ').trim();
+		}
+	}
+
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/loginPostWithGoogle',
+		'google_token',
+		!!google_token,
+		'otp_code',
+		!!otp_code,
+		'captcha',
+		captcha ? `…${String(captcha).slice(-10)}` : '',
+		'service',
+		service,
+		'long_term',
+		long_term,
+		'ip',
+		ip,
+		'device',
+		device,
+		'domain',
+		domain,
+		'origin',
+		origin,
+		'referer',
+		referer
+	);
+
+	try {
+		// Enforce kit configuration: only allow when google_oauth configured
+		const googleOAuthConfig = toolsLib?.getKitConfig?.()?.google_oauth?.client_id;
+		if (!googleOAuthConfig || (typeof googleOAuthConfig === 'string' && googleOAuthConfig.length === 0)) {
+			throw new Error(SERVICE_NOT_AVAILABLE);
+		}
+
+		// Enforce geo/IP restrictions the same as email login
+		await toolsLib.security.checkIp(ip, req.headers);
+
+		// Captcha is the very first gate, before any account lookup or
+		// outbound Google verification call, for the same reason it runs
+		// first in `loginPost`.
+		await toolsLib.security.checkCaptcha(captcha, ip, req.headers);
+
+		// Verify Google token (validates iss/aud/exp/email_verified inside).
+		const googleUserData = await toolsLib.user.verifyGoogleToken(google_token);
+		const email = googleUserData.email.toLowerCase().trim();
+		const tokenGoogleId = googleUserData.google_id || googleUserData.sub;
+
+		// Generate a random password for Google OAuth users
+		const randomPassword = crypto.randomBytes(16).toString('hex');
+
+		// Check if user exists, otherwise create it
+		let user = await toolsLib.user.getUserByEmail(email, false);
+		if (!user) {
+			await toolsLib.user.signUpUser(email, randomPassword, {
+				google_id: tokenGoogleId,
+				email_verified: true,
+				activated: true
+			}, version);
+			user = await toolsLib.user.getUserByEmail(email, false);
+			if (!user) {
+				throw new Error(USER_NOT_FOUND);
+			}
+		}
+
+		// If user has google_id set and it does not match, reject
+		if (user.google_id && tokenGoogleId && user.google_id !== tokenGoogleId) {
+			throw new Error(GOOGLE_ACCOUNT_MISMATCH);
+		}
+		// If user has no google_id yet, link it now
+		if (!user.google_id && tokenGoogleId) {
+			await user.update({ google_id: tokenGoogleId }, { fields: ['google_id'], returning: true });
+		}
+
+		if (!ip) {
+			throw new Error(NO_IP_FOUND);
+		}
+		if (user.verification_level === 0) {
+			throw new Error(USER_NOT_VERIFIED);
+		} else if (toolsLib.getKitConfig().email_verification_required && !user.email_verified) {
+			throw new Error(USER_EMAIL_NOT_VERIFIED);
+		} else if (!user.activated) {
+			throw new Error(USER_NOT_ACTIVATED);
+		}
+
+		const latestLogin = await toolsLib.user.findUserLatestLogin(user, false);
+		if (latestLogin && latestLogin.attempt >= NUMBER_OF_ALLOWED_ATTEMPTS && latestLogin.status == false) {
+			throw new Error(LOGIN_NOT_ALLOW);
+		}
+
+		// OTP gate. If the user has TOTP enabled we require an `otp_code`
+		// even though Google has already authenticated the email, because
+		// 2FA is an exchange-side control and must not be bypassable by
+		// switching login methods. A missing code is *not* counted as a
+		// failed login (the credentials were correct, the user just hasn't
+		// typed their second factor); a wrong code IS.
+		if (user.otp_enabled) {
+			if (!otp_code) {
+				throw new Error(INVALID_OTP_CODE);
+			}
+			try {
+				await toolsLib.security.verifyOtpBeforeAction(user.id, otp_code);
+			} catch (err) {
+				await toolsLib.user.createUserLogin(
+					user, ip, device, domain, origin, referer, null, long_term, false, req.headers
+				);
+				const loginData = await toolsLib.user.findUserLatestLogin(user, false);
+				const message = createAttemptMessage(loginData, user, domain);
+				throw new Error((err?.message || INVALID_OTP_CODE) + message);
+			}
+		}
+
+		// Suspicious-login geo confirmation. Identical to `loginPost`: if
+		// this user has previous successful logins but never from this
+		// country, we don't issue a token; instead we mail a confirmation
+		// code and require the user to confirm before the next attempt.
+		const lastLogins = await toolsLib.user.findUserLastLogins(user);
+		const successfulRecords = (lastLogins || []).filter((login) => login.status);
+		const country = toolsLib.security.getCountryFromIp(ip, req.headers);
+		const suspiciousLoginEnabled = toolsLib?.getKitConfig()?.suspicious_login?.active;
+		let suspiciousLogin = false;
+		if (suspiciousLoginEnabled && SMTP_SERVER()?.length > 0) {
+			if (
+				isArray(lastLogins) &&
+				lastLogins.length > 0 &&
+				!successfulRecords?.find((login) => login.country === country)
+			) {
+				suspiciousLogin = true;
+			}
+		}
+
+		if (suspiciousLoginEnabled && suspiciousLogin && SMTP_SERVER()?.length > 0) {
+			const verification_code = generateAuthCode(version, { fallback: 'token' });
+			const susLogin = await toolsLib.user.createSuspiciousLogin(
+				user, ip, device, country, domain, origin, referer, null, long_term
+			);
+			const data = {
+				id: susLogin.id,
+				email: user.email,
+				verification_code,
+				ip,
+				time,
+				device,
+				country,
+				user_id: user.id
+			};
+			await toolsLib.database.client.setexAsync(
+				`user:confirm-login:${verification_code}`,
+				5 * 60,
+				JSON.stringify(data)
+			);
+			await toolsLib.database.client.setexAsync(
+				`user:freeze-account:${verification_code}`,
+				60 * 60 * 6,
+				JSON.stringify(data)
+			);
+			await toolsLib.verification.sendVerificationCode(user, {
+				action_type: 'login_verification',
+				verification_code,
+				emailType: version === 'v3' || version === 'v4'
+					? MAILTYPE.SUSPICIOUS_LOGIN_CODE
+					: MAILTYPE.SUSPICIOUS_LOGIN,
+				emailData: data,
+				requestVerificationMethod: verification_method,
+				domain
+			});
+			throw new Error('Suspicious login detected, please check your email.');
+		}
+
+		// Send login email notification if not a service login
+		if (!service && isEmail(user.email)) {
+			const data = { ip, time, device, country };
+			sendEmail(MAILTYPE.LOGIN, user.email, data, user.settings, domain);
+		}
+
+		// Get user role
+		let userRole;
+		if (user.role) {
+			const roles = toolsLib.getRoles();
+			userRole = roles.find(role => role.role_name === user.role);
+		}
+
+		// Issue token
+		const token = await toolsLib.security.issueToken(
+			user.id,
+			user.network_id,
+			user.email,
+			ip,
+			long_term ? TOKEN_TIME_LONG : TOKEN_TIME_NORMAL,
+			user.settings.language,
+			userRole?.permissions,
+			userRole?.configs,
+			user.role
+		);
+
+		await toolsLib.user.createUserLogin(user, ip, device, domain, origin, referer, token, long_term, true, req.headers);
+
+		// Publish login event
+		publisher.publish(EVENTS_CHANNEL, JSON.stringify({
+			type: 'user',
+			data: {
+				action: 'login',
+				user_id: user.id
+			}
+		}));
+
+		return res.status(201).json({ 
+			token,
+			oauth_login: true
+		});
+
+	} catch (err) {
+		loggerUser.error(req.uuid, 'controllers/user/loginPostWithGoogle catch', err.message);
+		return res.status(err.statusCode || 401).json({ 
+			message: errorMessageConverter(err, req?.auth?.sub?.lang)?.message, 
+			lang: errorMessageConverter(err, req?.auth?.sub?.lang)?.lang, 
+			code: errorMessageConverter(err, req?.auth?.sub?.lang)?.code 
+		});
+	}
+};
+
+const confirmLogin = (req, res) => {
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/confirmLogin auth',
+		req.auth
+	);
+
+	toolsLib.user.confirmUserLogin(req.swagger.params.data.value.token)
+		.then(() => {
+			return res.json({ message: 'Success' });
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/confirmLogin err',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const freezeUserByCode = (req, res) => {
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/freezeUserByCode auth',
+		req.auth
+	);
+
+	toolsLib.user.freezeUserByCode(req.swagger.params.data.value.token)
+		.then(() => {
+			return res.json({ message: 'Success' });
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/freezeUserByCode err',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const verifyToken = (req, res) => {
+	loggerUser.debug(req.uuid, 'controllers/user/verifyToken', req.auth.sub);
+	return res.json({ message: 'Valid Token' });
+};
+
+function requestEmailConfirmation(req, res) {
+	loggerUser.verbose(req.uuid, 'controllers/user/requestEmailConfirmation auth', req.auth.sub);
+	let email = req.auth.sub.email;
+	const ip = req.headers['x-real-ip'];
+	const domain = req.headers['x-real-origin'];
+	loggerUser.verbose(req.uuid, 'controllers/user/requestEmailConfirmation ip', ip, domain);
+
+	if (!email || typeof email !== 'string' || !isEmail(email)) {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/requestEmailConfirmation invalid email',
+			email
+		);
+		return res.status(400).json({ message: `Invalid email: ${email}` });
+	}
+
+	email = email.toLowerCase();
+
+	toolsLib.security.sendConfirmationEmail(req.auth.sub.id, domain)
+		.then(() => {
+			return res.json({ message: `Confirmation email sent to: ${email}` });
+		})
+		.catch((err) => {
+			let errorMessage = errorMessageConverter(err, req?.auth?.sub?.lang)?.message;
+
+			if (errorMessage === USER_NOT_FOUND) {
+				errorMessage = 'User not found';
+			}
+
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/requestEmailConfirmation',
+				err.message
+			);
+			return res.status(err.statusCode || 400).json({ message: errorMessage });
+		});
+}
+
+const requestResetPassword = (req, res) => {
+	const value = req.swagger.params.value && req.swagger.params.value.value;
+	const email = req.swagger.params.email && req.swagger.params.email.value;
+	const phone_number = req.swagger.params.phone_number && req.swagger.params.phone_number.value;
+	let version = req.swagger.params.version.value;
+	const verification_method = req.swagger.params.verification_method
+		&& req.swagger.params.verification_method.value;
+	const captcha = req.swagger.params.captcha && req.swagger.params.captcha.value;
+	const ip = req.headers['x-real-ip'];
+	const domain = req.headers['x-real-origin'];
+	let identifier = value || phone_number || email;
+
+	loggerUser.info(
+		req.uuid,
+		'controllers/user/requestResetPassword',
+		identifier,
+		'identifier',
+		'ip',
+		ip,
+		'domain',
+		domain
+	);
+
+	if (
+		!identifier ||
+		typeof identifier !== 'string' ||
+		(!isEmail(identifier) && !isMobilePhone(identifier.trim(), 'any', { strictMode: true }))
+	) {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/requestResetPassword invalid identifier',
+			identifier
+		);
+		const messageObj = errorMessageConverter({ message: RESET_PASSWORD_REQUEST_SENT_IF_USER_EXISTS }, req?.auth?.sub?.lang);
+		return res.status(200).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+	}
+
+	identifier = isEmail(identifier) ? identifier.toLowerCase() : identifier.trim();
+
+	toolsLib.security.sendResetPasswordCode(
+		identifier,
+		captcha,
+		ip,
+		domain,
+		version,
+		req.headers,
+		verification_method
+	)
+		.then(() => {
+			const messageObj = errorMessageConverter({ message: RESET_PASSWORD_REQUEST_SENT_IF_USER_EXISTS }, req?.auth?.sub?.lang);
+			return res.json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/requestResetPassword', err.message);
+
+			// Surface captcha failures so the client can prompt a new challenge.
+			if (err?.message === INVALID_CAPTCHA) {
+				const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+				return res.status(err.statusCode || 400).json({
+					message: messageObj?.message,
+					lang: messageObj?.lang,
+					code: messageObj?.code
+				});
+			}
+
+			// Obfuscate user existence (and other internal errors) to prevent enumeration.
+			const messageObj = errorMessageConverter({ message: RESET_PASSWORD_REQUEST_SENT_IF_USER_EXISTS }, req?.auth?.sub?.lang);
+			return res.status(200).json({
+				message: messageObj?.message,
+				lang: messageObj?.lang,
+				code: messageObj?.code
+			});
+		});
+};
+
+const resetPassword = (req, res) => {
+	const { code, new_password } = req.swagger.params.data.value;
+
+	toolsLib.security.resetUserPassword(code, new_password)
+		.then(() => {
+			const messageObj = errorMessageConverter({ message: 'Password updated.' }, req?.auth?.sub?.lang);
+			return res.json({ message: messageObj?.message, lang: messageObj?.lang });
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/resetPassword', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const getUser = (req, res) => {
+	loggerUser.debug(req.uuid, 'controllers/user/getUser', req.auth.sub);
+	const id = req.auth.sub.id;
+
+	toolsLib.user.getUserByKitId(id, true, true, {
+		additionalHeaders: {
+			'x-forwarded-for': req.headers['x-forwarded-for']
+		}
+	})
+		.then((user) => {
+			if (!user) {
+				throw new Error(USER_NOT_FOUND);
+			}
+			const roles = toolsLib.getRoles();
+			const userRole = roles.find(role => role.role_name === user.role);
+			if (userRole) {
+				user.configs = userRole?.configs;
+				user.permissions = userRole?.permissions;
+				user.restrictions = userRole?.restrictions;
+			}
+			return res.json(toolsLib.user.omitUserFields(user));
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/getUser', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const updateSettings = (req, res) => {
+	loggerUser.debug(req.uuid, 'controllers/user/updateSettings', req.auth.sub);
+	const email = req.auth.sub.email;
+	loggerUser.debug(
+		req.uuid,
+		'controllers/user/updateSettings',
+		req.swagger.params.data.value
+	);
+	const data = req.swagger.params.data.value;
+
+	toolsLib.user.updateUserSettings({ email }, data)
+		.then((user) => res.json(user))
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/updateSettings', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const changePassword = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/changePassword', req.auth.sub);
+	const email = req.auth.sub.email;
+	const { old_password, new_password, otp_code, version, verification_method } = req.swagger.params.data.value;
+	const ip = req.headers['x-real-ip'];
+	const domain = API_HOST + HOLLAEX_NETWORK_BASE_URL;
+
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/changePassword',
+		ip,
+		otp_code
+	);
+
+	toolsLib.security.changeUserPassword(
+		email,
+		old_password,
+		new_password,
+		ip,
+		domain,
+		otp_code,
+		version,
+		verification_method
+	)
+		.then(() => res.json({ message: `Verification email to change password is sent to: ${email}` }))
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/changePassword', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const setInitialPassword = async (req, res) => {
+	let { email, phone_number } = req.swagger.params.data.value;
+	const { password } = req.swagger.params.data.value;
+	const ip = req.headers['x-real-ip'];
+	const domain = req.headers['x-real-origin'];
+	const origin = req.headers.origin;
+	const referer = req.headers.referer;
+
+	const hasEmail = typeof email === 'string' && email.trim().length > 0;
+	const hasPhone = typeof phone_number === 'string' && phone_number.trim().length > 0;
+
+	if (hasEmail && hasPhone) {
+		loggerUser.error(req.uuid, 'controllers/user/setInitialPassword both email and phone provided', ip, domain, origin, referer);
+		const messageObj = errorMessageConverter({ message: SIGNUP_EMAIL_OR_PHONE_NOT_BOTH }, req?.auth?.sub?.lang);
+		return res.status(400).json({
+			message: messageObj?.message,
+			lang: messageObj?.lang,
+			code: messageObj?.code
+		});
+	}
+
+	if (!hasEmail && !hasPhone) {
+		loggerUser.error(req.uuid, 'controllers/user/setInitialPassword missing email and phone', ip, domain, origin, referer);
+		const messageObj = errorMessageConverter({ message: PROVIDE_VALID_EMAIL }, req?.auth?.sub?.lang);
+		return res.status(400).json({
+			message: messageObj?.message,
+			lang: messageObj?.lang,
+			code: messageObj?.code
+		});
+	}
+
+	try {
+		let resolvedEmail;
+		if (hasPhone) {
+			const phone = phone_number.trim();
+			if (!isMobilePhone(phone, 'any', { strictMode: true })) {
+				loggerUser.error(req.uuid, 'controllers/user/setInitialPassword invalid phone', phone, ip, domain, origin, referer);
+				const messageObj = errorMessageConverter({ message: PROVIDE_VALID_PHONE }, req?.auth?.sub?.lang);
+				return res.status(400).json({
+					message: messageObj?.message,
+					lang: messageObj?.lang,
+					code: messageObj?.code
+				});
+			}
+			loggerUser.verbose(req.uuid, 'controllers/user/setInitialPassword phone', phone);
+			const user = await toolsLib.user.getUserByPhoneNumber(phone, false);
+			if (!user) {
+				throw new Error(USER_NOT_FOUND);
+			}
+			resolvedEmail = user.email;
+		} else {
+			if (!isEmail(email)) {
+				loggerUser.error(req.uuid, 'controllers/user/setInitialPassword invalid email', email, ip, domain, origin, referer);
+				const messageObj = errorMessageConverter({ message: PROVIDE_VALID_EMAIL }, req?.auth?.sub?.lang);
+				return res.status(400).json({
+					message: messageObj?.message,
+					lang: messageObj?.lang,
+					code: messageObj?.code
+				});
+			}
+			resolvedEmail = email.toLowerCase().trim();
+			loggerUser.verbose(req.uuid, 'controllers/user/setInitialPassword', resolvedEmail);
+		}
+
+		await toolsLib.security.setInitialUserPassword(resolvedEmail, password);
+
+		return res.json({ message: PASSWORD_SET });
+	} catch (err) {
+		loggerUser.error(req.uuid, 'controllers/user/setInitialPassword', err.message);
+		const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+		return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+	}
+};
+
+const confirmChangePassword = (req, res) => {
+	const code = req.swagger.params.code.value;
+	const ip = req.headers['x-real-ip'];
+	const version = req.query?.version;
+
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/changePassword',
+		code,
+		ip
+	);
+
+	toolsLib.security.confirmChangeUserPassword(code)
+		.then(() => {
+			if (version && (version === 'v3' || version === 'v4')) {
+				return res.json({ message: 'Password updated.' });
+			}
+			return res.redirect(301, `${DOMAIN}/change-password-confirm/${code}?isSuccess=true`);
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/confirmChangeUserPassword', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const setUsername = (req, res) => {
+	loggerUser.debug(req.uuid, 'controllers/user/setUsername auth', req.auth.sub);
+
+	const { id } = req.auth.sub;
+	const { username } = req.swagger.params.data.value;
+
+	toolsLib.user.setUsernameById(id, username)
+		.then(() => res.json({ message: 'Username successfully changed' }))
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/setUsername', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const getUserLogins = (req, res) => {
+	loggerUser.debug(req.uuid, 'controllers/user/getUserLogins auth', req.auth.sub);
+
+	const user_id = req.auth.sub.id;
+	const { limit, status, page, order_by, order, start_date, end_date, format } = req.swagger.params;
+
+	if (start_date.value && !isDate(start_date.value)) {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/getUserLogins invalid start_date',
+			start_date.value
+		);
+		return res.status(400).json({ message: 'Invalid start date' });
+	}
+
+	if (end_date.value && !isDate(end_date.value)) {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/getUserLogins invalid end_date',
+			end_date.value
+		);
+		return res.status(400).json({ message: 'Invalid end date' });
+	}
+
+	if (order_by.value && typeof order_by.value !== 'string') {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/getUserLogins invalid order_by',
+			order_by.value
+		);
+		return res.status(400).json({ message: 'Invalid order by' });
+	}
+
+	toolsLib.user.getUserLogins({
+		userId: user_id,
+		status: status.value,
+		limit: limit.value,
+		page: page.value,
+		orderBy: order_by.value,
+		order: order.value,
+		startDate: start_date.value,
+		endDate: end_date.value,
+		format: format.value
+	})
+		.then((data) => {
+			if (format.value === 'csv') {
+				res.setHeader('Content-disposition', `attachment; filename=${toolsLib.getKitConfig().api_name}-logins.csv`);
+				res.set('Content-Type', 'text/csv');
+				return res.status(202).send(data);
+			} else {
+				return res.json(data);
+			}
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/getUserLogins', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const affiliationCount = (req, res) => {
+	loggerUser.debug(req.uuid, 'controllers/user/affiliationCount auth', req.auth.sub);
+
+	const user_id = req.auth.sub.id;
+
+	const { limit, page, order_by, order, start_date, end_date } = req.swagger.params;
+
+
+	toolsLib.user.getAffiliationCount(user_id, {
+		limit: limit.value,
+		page: page.value,
+		order_by: order_by.value,
+		order: order.value,
+		start_date: start_date.value,
+		end_date: end_date.value
+	})
+		.then((data) => {
+			loggerUser.verbose(req.uuid, 'controllers/user/affiliationCount count', data.count);
+			return res.json(data);
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/affiliationCount', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const connectReferral = (req, res) => {
+	loggerUser.debug(req.uuid, 'controllers/user/connectReferral auth', req.auth.sub);
+
+	const user_id = req.auth.sub.id;
+	const { code } = req.swagger.params.data.value;
+
+	toolsLib.user.connectUserReferral(code, user_id)
+		.then(() => res.json({ message: 'success' }))
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/connectReferral', err.message);
+			const messageObj = errorMessageConverter({ message: REFERRAL_CONNECT_FAILED }, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const getUserBalance = (req, res) => {
+	loggerUser.debug(req.uuid, 'controllers/user/getUserBalance auth', req.auth.sub);
+	const user_id = req.auth.sub.id;
+
+	toolsLib.wallet.getUserBalanceByKitId(user_id, {
+		additionalHeaders: {
+			'x-forwarded-for': req.headers['x-forwarded-for']
+		}
+	})
+		.then((balance) => {
+			return res.json(balance);
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/getUserBalance', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const deactivateUser = (req, res) => {
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/deactivateUser/auth',
+		req.auth
+	);
+	const { id, email } = req.auth.sub;
+
+	toolsLib.user.freezeUserById(id)
+		.then(() => {
+			return res.json({ message: `Account ${email} deactivated` });
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/deactivateUser',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const createCryptoAddress = (req, res) => {
+	loggerUser.debug(
+		req.uuid,
+		'controllers/user/createCryptoAddress',
+		req.auth.sub
+	);
+
+	const { id } = req.auth.sub;
+	const { crypto, network } = req.swagger.params;
+
+	loggerUser.info(
+		req.uuid,
+		'controllers/user/createCryptoAddress',
+		'crypto',
+		crypto.value,
+		'network',
+		network.value
+	);
+
+	if (!crypto.value || !toolsLib.subscribedToCoin(crypto.value)) {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/createCryptoAddress',
+			`Invalid crypto: "${crypto.value}"`
+		);
+		return res.status(404).json({ message: `Invalid crypto: "${crypto.value}"` });
+	}
+
+	toolsLib.user.getUserByKitId(id)
+		.then((user) => {
+			if (!user) {
+				throw new Error(USER_NOT_FOUND);
+			}
+			if (user.is_subaccount) {
+				throw new Error(SUBACCOUNT_CANNOT_GENERATE_ADDRESS);
+			}
+			toolsLib.wallet.validateDepositEnabled(crypto.value, network.value);
+			return toolsLib.user.createUserCryptoAddressByKitId(id, crypto.value, {
+				network: network.value,
+				additionalHeaders: {
+					'x-forwarded-for': req.headers['x-forwarded-for']
+				}
+			});
+		})
+		.then((data) => {
+			return res.status(201).json(data);
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/createCryptoAddress',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const getHmacToken = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/getHmacToken auth', req.auth.sub);
+
+	const { id } = req.auth.sub;
+
+	toolsLib.security.getUserKitHmacTokens(id)
+		.then((tokens) => {
+			return res.json(tokens);
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/getHmacToken err',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const createHmacToken = (req, res) => {
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/createHmacToken auth',
+		req.auth.sub
+	);
+
+	const { id: userId } = req.auth.sub;
+	const ip = req.headers['x-real-ip'];
+	const { name, otp_code, email_code, role, whitelisted_ips } = req.swagger.params.data.value;
+
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/createHmacToken data',
+		name,
+		otp_code,
+		email_code,
+		ip,
+		role,
+		whitelisted_ips
+	);
+
+	whitelisted_ips?.forEach((ip) => {
+		if (!toolsLib.validateIp(ip)) {
+			return res.status(400).json({ message: 'IP address is not valid.' });
+		}
+	});
+
+	toolsLib.security.confirmByEmail(userId, email_code)
+		.then((confirmed) => {
+			if (confirmed) {
+				// TODO check for the name duplication
+				return toolsLib.security.createUserKitHmacToken(userId, otp_code, ip, name, role, whitelisted_ips);
+			} else {
+				throw new Error(INVALID_VERIFICATION_CODE);
+			}
+		})
+		.then((token) => {
+			return res.json(token);
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/createHmacToken',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+function updateHmacToken(req, res) {
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/updateHmacToken auth',
+		req.auth.sub
+	);
+
+	const { id: userId } = req.auth.sub;
+	const ip = req.headers['x-real-ip'];
+	const { token_id, name, otp_code, email_code, permissions, whitelisted_ips, whitelisting_enabled } = req.swagger.params.data.value;
+
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/updateHmacToken data',
+		token_id,
+		name,
+		otp_code,
+		email_code,
+		permissions,
+		whitelisted_ips,
+		whitelisting_enabled,
+		ip,
+	);
+
+	whitelisted_ips?.forEach((ip) => {
+		if (!toolsLib.validateIp(ip)) {
+			return res.status(400).json({ message: 'IP address is not valid.' });
+		}
+	});
+
+	toolsLib.security.confirmByEmail(userId, email_code)
+		.then((confirmed) => {
+			if (confirmed) {
+				return toolsLib.security.updateUserKitHmacToken(userId, otp_code, ip, token_id, name, permissions, whitelisted_ips, whitelisting_enabled);
+			} else {
+				throw new Error(INVALID_VERIFICATION_CODE);
+			}
+		})
+		.then((token) => {
+			return res.json(token);
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/updateHmacToken',
+				err.message,
+				err.stack
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+}
+
+const deleteHmacToken = (req, res) => {
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/deleteHmacToken auth',
+		req.auth.sub
+	);
+
+	const { id: userId } = req.auth.sub;
+	const { token_id, otp_code, email_code } = req.swagger.params.data.value;
+	const ip = req.headers['x-real-ip'];
+
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/deleteHmacToken data',
+		token_id,
+		otp_code,
+		email_code,
+		ip
+	);
+
+	toolsLib.security.confirmByEmail(userId, email_code)
+		.then((confirmed) => {
+			if (confirmed) {
+				return toolsLib.security.deleteUserKitHmacToken(userId, otp_code, token_id);
+			} else {
+				throw new Error(INVALID_VERIFICATION_CODE);
+			}
+		})
+		.then(() => {
+			return res.json({ message: TOKEN_REMOVED });
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/deleteHmacToken',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const getUserStats = (req, res) => {
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/getUserStats',
+		req.auth.sub
+	);
+	const user_id = req.auth.sub.id;
+
+	toolsLib.user.getUserStatsByKitId(user_id, {
+		additionalHeaders: {
+			'x-forwarded-for': req.headers['x-forwarded-for']
+		}
+	})
+		.then((stats) => {
+			return res.json(stats);
+		})
+		.catch((err) => {
+			loggerUser.error('controllers/user/getUserStats', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const userCheckTransaction = (req, res) => {
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/userCheckTransaction auth',
+		req.auth
+	);
+
+	const {
+		currency,
+		transaction_id,
+		address,
+		network,
+		is_testnet
+	} = req.swagger.params;
+
+	if (!currency.value || typeof currency.value !== 'string') {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/userCheckTransaction invalid currency',
+			currency.value
+		);
+		return res.status(400).json({ message: 'Invalid currency' });
+	}
+
+	if (!transaction_id.value || typeof transaction_id.value !== 'string') {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/userCheckTransaction invalid transaction_id',
+			transaction_id.value
+		);
+		return res.status(400).json({ message: 'Invalid Transaction Id' });
+	}
+
+	if (!address.value || typeof address.value !== 'string') {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/userCheckTransaction invalid address',
+			address.value
+		);
+		return res.status(400).json({ message: 'Invalid address' });
+	}
+
+	if (!network.value || typeof network.value !== 'string') {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/userCheckTransaction invalid network',
+			network.value
+		);
+		return res.status(400).json({ message: 'Invalid network' });
+	}
+
+	toolsLib.wallet.checkTransaction(currency.value, transaction_id.value, address.value, network.value, is_testnet.value, {
+		additionalHeaders: {
+			'x-forwarded-for': req.headers['x-forwarded-for']
+		}
+	})
+		.then((transaction) => {
+			return res.json({ message: 'Success', transaction });
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/userCheckTransaction catch',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const addUserBank = (req, res) => {
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/addUserBank auth',
+		req.auth
+	);
+	let email = req.auth.sub.email;
+	let data = req.swagger.params.data.value;
+
+	if (!data.type) {
+		return res.status(400).json({ message: 'No type is selected' });
+	}
+
+	let bank_account = {};
+
+	toolsLib.user.getUserByEmail(email, false)
+		.then(async (user) => {
+			if (!user) {
+				throw new Error('User not found');
+			}
+
+			if (!toolsLib.getKitConfig().user_payments) {
+				throw new Error('Payment system fields are not defined yet');
+			}
+
+			if (!toolsLib.getKitConfig().user_payments[data.type]) {
+				throw new Error('Payment system fields are not defined yet');
+			}
+
+			each(toolsLib.getKitConfig().user_payments[data.type].data, ({ required, key }) => {
+				if (required && !Object.prototype.hasOwnProperty.call(data, key)) {
+					throw new Error(`Missing field: ${key}`);
+				}
+				if (Object.prototype.hasOwnProperty.call(data, key)) {
+					bank_account[key] = data[key];
+				}
+			});
+
+			if (Object.keys(bank_account).length === 0) {
+				throw new Error('No payment system fields to add');
+			}
+
+			bank_account.type = data.type || 'bank';
+
+			bank_account.id = crypto.randomBytes(8).toString('hex');
+			bank_account.status = VERIFY_STATUS.PENDING;
+
+			const currentBanks = Array.isArray(user.bank_account) ? user.bank_account : [];
+			const newBank = [...currentBanks, bank_account];
+
+			user.changed('bank_account', true);
+			const updatedUser = await user.update(
+				{ bank_account: newBank },
+				{ fields: ['bank_account'] }
+			);
+
+			sendEmail(
+				MAILTYPE.ALERT,
+				null,
+				{
+					type: 'New bank added by a user',
+					data: `<div><p>User email ${email} just added a new bank.<br>Details:<br>${Object.keys(bank_account).map(key => {
+						return `${key}: ${bank_account[key]} <br>`;
+					}).join('')}</div></p>`
+				},
+				{}
+			);
+
+
+			return res.json(updatedUser.bank_account);
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/addUserBank catch', err.message);
+			return res.status(err.status || 400).json({ message: err.message });
+		});
+};
+
+const getUserSessions = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/getUserSessions/auth', req.auth);
+
+	const { limit, status, page, order_by, order, start_date, end_date, format } = req.swagger.params;
+
+	const user_id = req.auth.sub.id;
+
+	if (order_by.value && typeof order_by.value !== 'string') {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/getUserSessions invalid order_by',
+			order_by.value
+		);
+		return res.status(400).json({ message: 'Invalid order by' });
+	}
+
+	toolsLib.user.getExchangeUserSessions({
+		user_id: user_id,
+		status: status.value,
+		limit: limit.value,
+		page: page.value,
+		order_by: order_by.value,
+		order: order.value,
+		start_date: start_date.value,
+		end_date: end_date.value,
+		format: format.value
+	}
+	)
+		.then((data) => {
+			if (format.value === 'csv') {
+				res.setHeader('Content-disposition', `attachment; filename=${toolsLib.getKitConfig().api_name}-logins.csv`);
+				res.set('Content-Type', 'text/csv');
+				return res.status(202).send(data);
+			} else {
+				return res.json(data);
+			}
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/getUserSessions', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const revokeUserSession = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/revokeUserSession/auth', req.auth);
+
+	const { session_id } = req.swagger.params.data.value;
+
+	const user_id = req.auth.sub.id;
+
+	toolsLib.user.revokeExchangeUserSession(session_id, user_id)
+		.then((data) => {
+			return res.json(data);
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/revokeUserSession', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const userLogout = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/userLogout/auth', req.auth);
+
+	const user_id = req.auth.sub.id;
+
+	const bearer = req.headers['authorization'];
+	const tokenString = bearer.split(' ')[1];
+
+	toolsLib.security.findSession(tokenString)
+		.then((session) => {
+			return toolsLib.user.revokeExchangeUserSession(session.id, user_id);
+		})
+		.then(() => {
+			return res.json({ message: 'Success' });
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/userLogout', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const userDelete = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/userDelete/auth', req.auth);
+
+	const { email_code, otp_code } = req.swagger.params.data.value;
+	const user_id = req.auth.sub.id;
+
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/userDelete',
+		'user_id',
+		user_id,
+		'email_code',
+		email_code
+	);
+	toolsLib.security.verifyOtpBeforeAction(user_id, otp_code)
+		.then((validOtp) => {
+			if (!validOtp) {
+				throw new Error(INVALID_OTP_CODE);
+			}
+
+			return toolsLib.security.confirmByEmail(user_id, email_code);
+		})
+		.then((confirmed) => {
+			if (confirmed) {
+				return toolsLib.user.deleteKitUser(user_id);
+			} else {
+				throw new Error(INVALID_VERIFICATION_CODE);
+			}
+		})
+		.then(() => {
+			return res.json({ message: 'Success' });
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/userDelete', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const getUserBalanceHistory = (req, res) => {
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/getUserBalanceHistory/auth',
+		req.auth
+	);
+	const user_id = req.auth.sub.id;
+	const { limit, page, order_by, order, start_date, end_date, format } = req.swagger.params;
+
+	if (start_date.value && !isDate(start_date.value)) {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/getUserBalanceHistory invalid start_date',
+			start_date.value
+		);
+		return res.status(400).json({ message: 'Invalid start date' });
+	}
+
+	if (end_date.value && !isDate(end_date.value)) {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/getUserBalanceHistory invalid end_date',
+			end_date.value
+		);
+		return res.status(400).json({ message: 'Invalid end date' });
+	}
+
+	if (order_by.value && typeof order_by.value !== 'string') {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/getUserBalanceHistory invalid order_by',
+			order_by.value
+		);
+		return res.status(400).json({ message: 'Invalid order by' });
+	}
+
+	if (!user_id || !isInteger(user_id)) {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/getUserBalanceHistory invalid user_id',
+			user_id
+		);
+		return res.status(400).json({ message: 'Invalid user id' });
+	}
+
+	toolsLib.user.getUserBalanceHistory({
+		user_id,
+		limit: limit.value,
+		page: page.value,
+		orderBy: order_by.value,
+		order: order.value,
+		startDate: start_date.value,
+		endDate: end_date.value,
+		format: format.value
+	})
+		.then((data) => {
+			if (format.value === 'csv') {
+				res.setHeader('Content-disposition', `attachment; filename=${toolsLib.getKitConfig().api_name}-balance_history.csv`);
+				res.set('Content-Type', 'text/csv');
+				return res.status(202).send(data);
+			} else {
+				return res.json(data);
+			}
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/getUserBalanceHistory',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const fetchUserProfitLossInfo = (req, res) => {
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/fetchUserProfitLossInfo/auth',
+		req.auth
+	);
+	const { period } = req.swagger.params;
+	const user_id = req.auth.sub.id;
+
+	toolsLib.user.fetchUserProfitLossInfo(user_id, { period: period.value || 7 })
+		.then((data) => {
+			return res.json(data);
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/fetchUserProfitLossInfo', err.message);
+			return res.status(err.statusCode || 400).json({ message: 'Something went wrong' });
+		});
+};
+
+const getUnrealizedUserReferral = (req, res) => {
+	loggerUser.info(
+		req.uuid,
+		'controllers/user/getUnrealizedUserReferral',
+	);
+
+	if (
+		!toolsLib.getKitConfig().referral_history_config ||
+		!toolsLib.getKitConfig().referral_history_config.active
+	) {
+		// TODO it should be added to the messages
+		throw new Error('Feature is not active');
+	}
+
+	toolsLib.user.getUnrealizedReferral(req.auth.sub.id)
+		.then((data) => {
+			return res.json({ data });
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/getUnrealizedUserReferral err',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const getRealizedUserReferral = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/getRealizedUserReferral/auth', req.auth);
+
+	const { limit, page, order_by, order, start_date, end_date, format } = req.swagger.params;
+
+	if (order_by.value && typeof order_by.value !== 'string') {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/getRealizedUserReferral invalid order_by',
+			order_by.value
+		);
+		return res.status(400).json({ message: 'Invalid order by' });
+	}
+
+	toolsLib.user.getRealizedReferral({
+		user_id: req.auth.sub.id,
+		limit: limit.value,
+		page: page.value,
+		order_by: order_by.value,
+		order: order.value,
+		start_date: start_date.value,
+		end_date: end_date.value,
+		format: format.value
+	}
+	)
+		.then((data) => {
+			if (format.value === 'csv') {
+				toolsLib.user.createAuditLog({ email: req?.auth?.sub?.email, session_id: req?.session_id }, req?.swagger?.apiPath, req?.swagger?.operationPath?.[2], req?.swagger?.params);
+				res.setHeader('Content-disposition', `attachment; filename=${toolsLib.getKitConfig().api_name}-logins.csv`);
+				res.set('Content-Type', 'text/csv');
+				return res.status(202).send(data);
+			} else {
+				return res.json(data);
+			}
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/getRealizedUserReferral', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const getUserReferralCodes = (req, res) => {
+	loggerUser.info(
+		req.uuid,
+		'controllers/user/getUserReferralCodes',
+	);
+
+	if (
+		!toolsLib.getKitConfig().referral_history_config ||
+		!toolsLib.getKitConfig().referral_history_config.active
+	) {
+		// TODO it should be added to the messages
+		throw new Error('Feature is not active');
+	}
+
+	toolsLib.user.getUserReferralCodes({ user_id: req.auth.sub.id })
+		.then((data) => {
+			return res.json({ data });
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/getUserReferralCodes err',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const createUserReferralCode = (req, res) => {
+	loggerUser.info(
+		req.uuid,
+		'controllers/user/createUserReferralCode',
+	);
+	const { discount, earning_rate, code } = req.swagger.params.data.value;
+
+	if (
+		!toolsLib.getKitConfig().referral_history_config ||
+		!toolsLib.getKitConfig().referral_history_config.active
+	) {
+		// TODO it should be added to the messages
+		throw new Error('Feature is not active');
+	}
+
+	toolsLib.user.createUserReferralCode({
+		user_id: req.auth.sub.id,
+		discount,
+		earning_rate,
+		code
+	})
+		.then(() => {
+			return res.json({ message: 'success' });
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/createUserReferralCode err',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const settleUserFees = (req, res) => {
+	loggerUser.info(
+		req.uuid,
+		'controllers/user/settleUserFees',
+	);
+
+	if (
+		!toolsLib.getKitConfig().referral_history_config ||
+		!toolsLib.getKitConfig().referral_history_config.active
+	) {
+		// TODO it should be added to the messages
+		throw new Error('Feature is not active');
+	}
+
+	toolsLib.user.settleFees(req.auth.sub.id)
+		.then(() => {
+			return res.json({ message: 'success' });
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/settleUserFees err',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const fetchUserReferrals = (req, res) => {
+	const { limit, page, order_by, order, start_date, end_date, format } = req.swagger.params;
+
+	loggerUser.info(
+		req.uuid,
+		'controllers/user/referrals',
+		limit,
+		page,
+		order_by,
+		order,
+		start_date,
+		end_date,
+		format
+	);
+
+	if (
+		!toolsLib.getKitConfig().referral_history_config ||
+		!toolsLib.getKitConfig().referral_history_config.active
+	) {
+		// TODO it should be added to the messages
+		throw new Error('Feature is not active');
+	}
+
+	toolsLib.user.fetchUserReferrals(
+		{
+			user_id: req.auth.sub.id,
+			limit: limit.value,
+			page: page.value,
+			order_by: order_by.value,
+			order: order.value,
+			start_date: start_date.value,
+			end_date: end_date.value,
+			format: format.value
+		}
+	)
+		.then((referrals) => {
+			return res.json(referrals);
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/referrals err',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const fetchUserTradingVolume = (req, res) => {
+	const { to, from } = req.swagger.params;
+
+	loggerUser.info(
+		req.uuid,
+		'controllers/user/fetchUserTradingVolume',
+		to.value,
+		from.value
+	);
+
+	toolsLib.user.fetchUserTradingVolume(
+		req.auth.sub.id,
+		{
+			to: to.value,
+			from: from.value
+		}
+	)
+		.then((data) => {
+			return res.json(data);
+		})
+		.catch((err) => {
+			loggerUser.error(
+				req.uuid,
+				'controllers/user/fetchUserTradingVolume err',
+				err.message
+			);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const fetchUserAddressBook = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/fetchUserAddressBook/auth', req.auth);
+
+	toolsLib.user.fetchUserAddressBook(req.auth.sub.id)
+		.then((data) => {
+			return res.json(data);
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/fetchUserAddressBook', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const updateUserAddresses = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/updateUserAddresses/auth', req.auth);
+
+	const { addresses } = req.swagger.params.data.value;
+
+	loggerUser.verbose(req.uuid, 'controllers/user/updateUserAddresses data', req.auth.sub.id, addresses);
+
+	toolsLib.user.updateUserAddresses(req.auth.sub.id, { addresses })
+		.then((data) => {
+			return res.json(data);
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/updateUserAddresses err', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const requestAddressWhitelist = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/requestAddressWhitelist/auth', req.auth);
+
+	const { address, currency, network, otp_code, version, verification_method } = req.swagger.params.data.value;
+	const domain = req.headers['x-real-origin'];
+	const ip = req.headers['x-real-ip'];
+
+	toolsLib.user.requestAddressWhitelist(req.auth.sub.id, { address, currency, network }, {
+		otpCode: otp_code,
+		domain,
+		ip,
+		version,
+		verification_method
+	})
+		.then(() => {
+			return res.json({ message: 'Success' });
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/requestAddressWhitelist err', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const confirmAddressWhitelist = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/confirmAddressWhitelist/auth', req.auth);
+
+	const { token } = req.swagger.params.data.value;
+
+	toolsLib.user.confirmAddressWhitelist(req.auth.sub.id, token)
+		.then((data) => {
+			return res.json(data);
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/confirmAddressWhitelist err', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const getPaymentDetails = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/getPaymentDetails/auth', req.auth);
+
+	const { is_p2p, is_fiat_control, status, limit, page, order_by, order, start_date, end_date } = req.swagger.params;
+
+	const user_id = req.auth.sub.id;
+
+	toolsLib.user.getPaymentDetails(user_id,
+		{
+			limit: limit.value,
+			page: page.value,
+			order_by: order_by.value,
+			order: order.value,
+			start_date: start_date.value,
+			end_date: end_date.value,
+			is_p2p: is_p2p.value,
+			is_fiat_control: is_fiat_control.value,
+			status: status.value,
+		})
+		.then((data) => {
+			return res.json(data);
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/getPaymentDetails', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const createPaymentDetail = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/createPaymentDetail/auth', req.auth);
+
+	const user_id = req.auth.sub.id;
+	const { name, label, details, is_p2p, is_fiat_control, status } = req.swagger.params.data.value;
+
+	toolsLib.user.createPaymentDetail({
+		user_id,
+		name,
+		label,
+		details,
+		is_p2p,
+		is_fiat_control,
+		status
+	})
+		.then((data) => {
+			return res.json(data);
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/createPaymentDetail', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const updatePaymentDetail = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/updatePaymentDetail/auth', req.auth);
+
+	const user_id = req.auth.sub.id;
+	const { id, name, label, details, is_p2p, is_fiat_control } = req.swagger.params.data.value;
+
+	toolsLib.user.updatePaymentDetail(id, {
+		user_id,
+		name,
+		label,
+		details,
+		is_p2p,
+		is_fiat_control
+	})
+		.then((data) => {
+			return res.json(data);
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/updatePaymentDetail', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const deletePaymentDetail = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/deletePaymentDetail/auth', req.auth);
+
+	const user_id = req.auth.sub.id;
+	const { id } = req.swagger.params.data.value;
+
+	toolsLib.user.deletePaymentDetail(id, user_id)
+		.then(() => {
+			return res.json({
+				message: 'Success'
+			});
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/deletePaymentDetail', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+
+const fetchUserAutoTrades = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/fetchUserAutoTrades/auth', req.auth);
+
+	const { limit, page, order_by, order, start_date, end_date, active } = req.swagger.params;
+
+	if (order_by.value && typeof order_by.value !== 'string') {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/fetchUserAutoTrades invalid order_by',
+			order_by.value
+		);
+		return res.status(400).json({ message: 'Invalid order by' });
+	}
+
+	toolsLib.user.fetchUserAutoTrades(req.auth.sub.id, {
+		limit: limit.value,
+		page: page.value,
+		order_by: order_by.value,
+		order: order.value,
+		start_date: start_date.value,
+		end_date: end_date.value,
+		active: active.value
+	})
+		.then((data) => res.json(data))
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/fetchUserAutoTrades', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const createUserAutoTrade = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/createUserAutoTrade/auth', req.auth);
+
+	const { spend_coin, buy_coin, spend_amount, frequency, week_days, day_of_month, trade_hour, active, description } = req.swagger.params.data.value;
+
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/createUserAutoTrade data',
+		spend_coin, buy_coin, spend_amount, frequency, week_days, day_of_month, trade_hour, active, description
+	);
+
+	toolsLib.user.createUserAutoTrade(req.auth.sub.id, {
+		spend_coin,
+		buy_coin,
+		spend_amount,
+		frequency,
+		week_days,
+		day_of_month,
+		trade_hour,
+		active,
+		description
+	}, req.headers['x-real-ip'])
+		.then((data) => res.json(data))
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/createUserAutoTrade', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const updateUserAutoTrade = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/updateUserAutoTrade/auth', req.auth);
+
+	const { id, spend_coin, buy_coin, spend_amount, frequency, week_days, day_of_month, trade_hour, active, description } = req.swagger.params.data.value;
+
+	loggerUser.verbose(
+		req.uuid,
+		'controllers/user/updateUserAutoTrade data',
+		id, spend_coin, buy_coin, spend_amount, frequency, week_days, day_of_month, trade_hour, active, description
+	);
+
+	toolsLib.user.updateUserAutoTrade(req.auth.sub.id, {
+		id,
+		spend_coin,
+		buy_coin,
+		spend_amount,
+		frequency,
+		week_days,
+		day_of_month,
+		trade_hour,
+		active,
+		description
+	}, req.headers['x-real-ip'])
+		.then((data) => res.json(data))
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/updateUserAutoTrade', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const deleteUserAutoTrade = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/deleteUserAutoTrade/auth', req.auth);
+
+	const { removed_ids } = req.swagger.params.data.value;
+
+	loggerUser.verbose(req.uuid, 'controllers/user/deleteUserAutoTrade data', removed_ids);
+
+	toolsLib.user.deleteUserAutoTrade(
+		removed_ids,
+		req.auth.sub.id
+	)
+		.then(() => res.json({ message: 'Success' }))
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/deleteUserAutoTrade', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const fetchAnnouncements = (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/fetchAnnouncements/auth');
+
+	const { limit, page, order_by, order, start_date, end_date } = req.swagger.params;
+
+	if (order_by.value && typeof order_by.value !== 'string') {
+		loggerUser.error(
+			req.uuid,
+			'controllers/user/fetchAnnouncements invalid order_by',
+			order_by.value
+		);
+		return res.status(400).json({ message: 'Invalid order by' });
+	}
+
+	toolsLib.user.getAnnouncements({
+		limit: limit.value,
+		page: page.value,
+		order_by: order_by.value,
+		order: order.value,
+		start_date: start_date.value,
+		end_date: end_date.value,
+	})
+		.then((data) => {
+			return res.json(data);
+		})
+		.catch((err) => {
+			loggerUser.error(req.uuid, 'controllers/user/fetchAnnouncements', err.message);
+			const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+			return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+		});
+};
+
+const requestPasskeyOptions = async (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/requestPasskeyOptions', req.auth);
+
+	try {
+		const { generateRegistrationOptions } = require('@simplewebauthn/server');
+		const { rpName, rpID } = toolsLib.security.getPasskeyConfig(req);
+		const userId = req.auth.sub.id;
+		const userEmail = req.auth.sub.email;
+		const userName = userEmail.split('@')[0];
+
+		const existingPasskeys = await toolsLib.database.findAll('passkey', { where: { user_id: userId } });
+		const excludeCredentials = existingPasskeys.map((pk) => ({
+			id: pk.credential_id,
+			transports: pk.transports || []
+		}));
+
+		const options = await generateRegistrationOptions({
+			rpName,
+			rpID,
+			userName: userEmail,
+			userDisplayName: userName,
+			attestationType: 'none',
+			excludeCredentials: excludeCredentials.length > 0 ? excludeCredentials : undefined,
+			authenticatorSelection: {
+				residentKey: 'preferred',
+				userVerification: 'preferred'
+			}
+		});
+
+		await toolsLib.database.client.setexAsync(
+			`passkey:reg:challenge:${options.challenge}`,
+			5 * 60,
+			'1'
+		);
+
+		return res.json(options);
+	} catch (err) {
+		loggerUser.error(req.uuid, 'controllers/user/requestPasskeyOptions', err.message);
+		const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+		return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+	}
+};
+
+const passkeyAuthOptions = async (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/passkeyAuthOptions');
+
+	try {
+		const { generateAuthenticationOptions } = require('@simplewebauthn/server');
+		const { rpID } = toolsLib.security.getPasskeyConfig(req);
+		const email = req.swagger.params.email?.value;
+
+		if (!email || !isEmail(email)) {
+			throw new Error('Valid email is required');
+		}
+
+		const user = await toolsLib.user.getUserByEmail(email.toLowerCase().trim());
+		const passkeys = user
+			? await toolsLib.database.findAll('passkey', { where: { user_id: user.id } })
+			: [];
+		if (!user || passkeys.length === 0) {
+			throw new Error('Passkey is not activated for this account');
+		}
+
+		const allowCredentials = passkeys.map((pk) => ({
+			id: pk.credential_id,
+			transports: pk.transports || []
+		}));
+
+		const options = await generateAuthenticationOptions({
+			rpID,
+			allowCredentials,
+			userVerification: 'preferred'
+		});
+
+		await toolsLib.database.client.setexAsync(
+			`passkey:auth:challenge:${options.challenge}`,
+			5 * 60,
+			'1'
+		);
+
+		return res.json({
+			passkey_available: true,
+			options
+		});
+	} catch (err) {
+		loggerUser.error(req.uuid, 'controllers/user/passkeyAuthOptions', err.message);
+		const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+		return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+	}
+};
+
+const verifyPasskeyLogin = async (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/verifyPasskeyLogin');
+
+	try {
+		const { verifyAuthenticationResponse } = require('@simplewebauthn/server');
+		const { rpID, allowedOrigins } = toolsLib.security.getPasskeyConfig(req);
+		const ip = req.headers['x-real-ip'];
+		const device = req.headers['custom-device'] ? req.headers['user-agent'] : (req.headers['user-agent'] || '').substring(0, 1000);
+		const domain = req.headers['x-real-origin'] || req.headers.origin;
+		// Read all fields from the validated swagger payload, not from
+		// `req.body` directly. The previous code read `req.body?.data?.version`
+		// / `req.body?.data?.service`, which never matched the swagger 2.0
+		// shape — so `version` always silently fell through to the default
+		// and `service` was treated as absent.
+		const {
+			challenge,
+			credential,
+			version = 'v4',
+			service,
+			verification_method
+		} = req.swagger.params.data.value;
+
+		if (!challenge || !credential) {
+			throw new Error('challenge and credential are required');
+		}
+
+		const challengeKey = `passkey:auth:challenge:${challenge}`;
+		const storedChallenge = await toolsLib.database.client.getAsync(challengeKey);
+		if (!storedChallenge) {
+			throw new Error('Invalid passkey challenge');
+		}
+		await toolsLib.database.client.delAsync(challengeKey);
+
+		const passkeys = await toolsLib.database.findAll('passkey', {
+			where: { credential_id: credential.id }
+		});
+		const passkey = passkeys && passkeys[0];
+		if (!passkey) {
+			throw new Error(INVALID_CREDENTIALS);
+		}
+
+		const publicKey = passkey.public_key instanceof Buffer
+			? new Uint8Array(passkey.public_key)
+			: new Uint8Array(Buffer.from(passkey.public_key));
+
+		const verification = await verifyAuthenticationResponse({
+			response: credential,
+			expectedChallenge: challenge,
+			expectedOrigin: allowedOrigins,
+			expectedRPID: rpID,
+			credential: {
+				id: passkey.credential_id,
+				publicKey,
+				counter: Number(passkey.counter),
+				transports: passkey.transports || []
+			}
+		});
+
+		if (!verification.verified) {
+			throw new Error(INVALID_CREDENTIALS);
+		}
+
+		await toolsLib.database.update(
+			'passkey',
+			{ counter: verification.authenticationInfo.newCounter },
+			{ where: { id: passkey.id } }
+		);
+
+		const user = await toolsLib.user.getUserByKitId(passkey.user_id);
+		if (!user) {
+			throw new Error(USER_NOT_FOUND);
+		}
+
+		if (user.verification_level === 0) {
+			throw new Error(USER_NOT_VERIFIED);
+		} else if (toolsLib.getKitConfig().email_verification_required) {
+			if (toolsLib.user.isPhoneSignupSyntheticUser(user.dataValues || user)) {
+				if (!user.phone_number_verified) {
+					throw new Error(USER_PHONE_NOT_VERIFIED);
+				}
+			} else if (!user.email_verified) {
+				throw new Error(USER_EMAIL_NOT_VERIFIED);
+			}
+		}
+		if (!user.activated) {
+			throw new Error(USER_NOT_ACTIVATED);
+		}
+
+		const lastLogins = await toolsLib.user.findUserLastLogins(user);
+		const successfulRecords = (lastLogins || []).filter((login) => login.status);
+		const country = toolsLib.security.getCountryFromIp(ip, req.headers);
+		const suspiciousLoginEnabled = toolsLib?.getKitConfig()?.suspicious_login?.active;
+		let suspiciousLogin = false;
+		if (suspiciousLoginEnabled && SMTP_SERVER()?.length > 0 && isArray(lastLogins) && lastLogins.length > 0) {
+			suspiciousLogin = !successfulRecords?.find((login) => login.country === country);
+		}
+
+		if (suspiciousLoginEnabled && suspiciousLogin && SMTP_SERVER()?.length > 0) {
+			const verification_code = generateAuthCode(version, { fallback: 'token' });
+
+			const loginData = await toolsLib.user.createSuspiciousLogin(
+				user,
+				ip,
+				device,
+				country,
+				domain,
+				req.headers.origin,
+				req.headers.referer,
+				null,
+				false
+			);
+			const data = {
+				id: loginData.id,
+				email: user.email,
+				verification_code,
+				ip,
+				time: new Date(),
+				device,
+				country,
+				user_id: user.id,
+			};
+			await toolsLib.database.client.setexAsync(`user:confirm-login:${verification_code}`, 5 * 60, JSON.stringify(data));
+			await toolsLib.database.client.setexAsync(`user:freeze-account:${verification_code}`, 60 * 60 * 6, JSON.stringify(data));
+			await toolsLib.verification.sendVerificationCode(user, {
+				action_type: 'login_verification',
+				verification_code,
+				emailType: version === 'v3' || version === 'v4'
+					? MAILTYPE.SUSPICIOUS_LOGIN_CODE
+					: MAILTYPE.SUSPICIOUS_LOGIN,
+				emailData: data,
+				requestVerificationMethod: verification_method,
+				domain
+			});
+			throw new Error('Suspicious login detected, please check your email.');
+		}
+
+		const userRole = user.role ? toolsLib.getRoles().find((r) => r.role_name === user.role) : null;
+		const token = await toolsLib.security.issueToken(
+			user.id,
+			user.network_id,
+			user.email,
+			ip,
+			TOKEN_TIME_NORMAL,
+			user.settings.language,
+			userRole?.permissions,
+			userRole?.configs,
+			user.role
+		);
+
+		await toolsLib.user.createUserLogin(
+			user,
+			ip,
+			device,
+			domain,
+			req.headers.origin,
+			req.headers.referer,
+			token,
+			false,
+			true,
+			req.headers
+		);
+
+		publisher.publish(EVENTS_CHANNEL, JSON.stringify({
+			type: 'user',
+			data: { action: 'login', user_id: user.id },
+		}));
+
+		if (!service && isEmail(user.email)) {
+			sendEmail(MAILTYPE.LOGIN, user.email, { ip, time: new Date(), device, country }, user.settings, domain);
+		}
+
+		return res.status(201).json({ token });
+	} catch (err) {
+		loggerUser.error(req.uuid, 'controllers/user/verifyPasskeyLogin', err.message);
+		const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+		return res.status(err.statusCode || 401).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+	}
+};
+
+const activatePasskey = async (req, res) => {
+	loggerUser.verbose(req.uuid, 'controllers/user/activatePasskey', req.auth);
+
+	try {
+		const { verifyRegistrationResponse } = require('@simplewebauthn/server');
+		const { rpName, rpID, allowedOrigins } = toolsLib.security.getPasskeyConfig(req);
+		const userId = req.auth.sub.id;
+		const { challenge, credential, webauthn_user_id } = req.swagger.params.data.value;
+
+		if (!challenge || !credential || !webauthn_user_id) {
+			throw new Error('challenge, credential, and webauthn_user_id are required');
+		}
+
+		const challengeKey = `passkey:reg:challenge:${challenge}`;
+		const storedChallenge = await toolsLib.database.client.getAsync(challengeKey);
+		if (!storedChallenge) {
+			throw new Error('Passkey verification failed');
+		}
+		await toolsLib.database.client.delAsync(challengeKey);
+
+		const verification = await verifyRegistrationResponse({
+			response: credential,
+			expectedChallenge: challenge,
+			expectedOrigin: allowedOrigins,
+			expectedRPID: rpID
+		});
+
+		if (!verification.verified || !verification.registrationInfo) {
+			throw new Error('Passkey verification failed');
+		}
+
+		const { credential: regCredential, credentialDeviceType, credentialBackedUp } = verification.registrationInfo;
+
+		const publicKeyBuffer = Buffer.from(regCredential.publicKey);
+		const transports = Array.isArray(regCredential.transports) ? regCredential.transports : [];
+
+		await toolsLib.database.create('passkey', {
+			user_id: userId,
+			credential_id: regCredential.id,
+			public_key: publicKeyBuffer,
+			webauthn_user_id,
+			counter: regCredential.counter,
+			device_type: credentialDeviceType,
+			backed_up: credentialBackedUp,
+			transports
+		});
+
+		publisher.publish(EVENTS_CHANNEL, JSON.stringify({
+			type: 'user',
+			data: {
+				action: 'passkey_enabled',
+				user_id: userId
+			}
+		}));
+
+		return res.json({ message: 'Passkey created successfully' });
+	} catch (err) {
+		loggerUser.error(req.uuid, 'controllers/user/activatePasskey', err.message);
+		const messageObj = errorMessageConverter(err, req?.auth?.sub?.lang);
+		return res.status(err.statusCode || 400).json({ message: messageObj?.message, lang: messageObj?.lang, code: messageObj?.code });
+	}
+};
+
+module.exports = {
+	signUpUser,
+	signUpUserWithGoogle,
+	getVerifyUser,
+	requestUserSetEmail,
+	confirmUserSetEmail,
+	verifyUser,
+	loginPost,
+	loginWithGoogle,
+	verifyToken,
+	requestResetPassword,
+	resetPassword,
+	getUser,
+	updateSettings,
+	changePassword,
+	setInitialPassword,
+	confirmChangePassword,
+	setUsername,
+	getUserLogins,
+	affiliationCount,
+	connectReferral,
+	getUserBalance,
+	deactivateUser,
+	createCryptoAddress,
+	getHmacToken,
+	createHmacToken,
+	updateHmacToken,
+	deleteHmacToken,
+	getUserStats,
+	userCheckTransaction,
+	requestEmailConfirmation,
+	addUserBank,
+	revokeUserSession,
+	getUserSessions,
+	userLogout,
+	userDelete,
+	getUnrealizedUserReferral,
+	getRealizedUserReferral,
+	settleUserFees,
+	getUserBalanceHistory,
+	fetchUserProfitLossInfo,
+	fetchUserReferrals,
+	createUserReferralCode,
+	getUserReferralCodes,
+	fetchUserTradingVolume,
+	updateUserAddresses,
+	fetchUserAddressBook,
+	requestAddressWhitelist,
+	confirmAddressWhitelist,
+	getPaymentDetails,
+	createPaymentDetail,
+	updatePaymentDetail,
+	deletePaymentDetail,
+	fetchUserAutoTrades,
+	createUserAutoTrade,
+	updateUserAutoTrade,
+	deleteUserAutoTrade,
+	fetchAnnouncements,
+	confirmLogin,
+	freezeUserByCode,
+	requestPasskeyOptions,
+	activatePasskey,
+	passkeyAuthOptions,
+	verifyPasskeyLogin
+};

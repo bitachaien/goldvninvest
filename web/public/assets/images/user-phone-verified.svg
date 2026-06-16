@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg version="1.2" baseProfile="tiny" id="Layer_1" xmlns="http://www.w3.org/2000/svg"
+	 x="0px" y="0px" viewBox="0 0 60 60" overflow="visible" xml:space="preserve">
+<g fill="none" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+	<rect x="14" y="7" width="27" height="46" rx="3.5"/>
+	<line x1="24" y1="12" x2="31" y2="12"/>
+	<line x1="14" y1="17" x2="41" y2="17"/>
+	<line x1="14" y1="46" x2="41" y2="46"/>
+</g>
+<circle fill="#FFFFFF" cx="27.5" cy="49.5" r="1.7"/>
+<g id="Component_30_2" transform="translate(32.905)">
+	<circle id="Ellipse_110_1_" fill="#288500" cx="13.7" cy="21" r="12"/>
+	<polygon fill="#FFFFFF" points="13.5,27.8 8,23.6 9.5,21.6 12.7,24.1 17.9,15.2 20.1,16.4 	"/>
+</g>
+</svg>

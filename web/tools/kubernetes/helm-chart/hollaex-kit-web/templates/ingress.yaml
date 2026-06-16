@@ -1,0 +1,33 @@
+{{- if .Values.ingress.enabled }}
+{{- $host := .Values.ingress.host }}
+{{- $tlsSecret := .Values.ingress.tls.secretName | default (printf "%s-tls-cert" .Release.Name) }}
+{{- $svcName := .Release.Name }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Namespace }}-ingress-web
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    kubernetes.io/ingress.class: {{ .Values.ingress.className | quote }}
+    kubernetes.io/tls-acme: "true"
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.certManagerIssuer }}
+    nginx.ingress.kubernetes.io/proxy-body-size: {{ .Values.ingress.proxyBodySize | quote }}
+
+
+spec:
+  rules:
+  - host: {{ $host }}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ $svcName }}
+            port:
+              number: 80
+  tls:
+  - secretName: {{ $tlsSecret }}
+    hosts:
+    - {{ $host }}
+{{- end }}
