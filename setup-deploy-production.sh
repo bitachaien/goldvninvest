@@ -2,12 +2,10 @@
 
 ################################################################################
 # HollaEx Kit - Automated Setup & Production Deploy Script
-# Purpose: Complete setup and deployment for goldvninvest.online
+# Customized for: goldvninvest.online
 # Server: root@137.184.223.15
-# Domain: goldvninvest.online
 # Deploy Path: /var/www/goldvninvest.online
 # Created: 2026-06-16
-# Updated: 2026-06-16 - Production Ready Version
 ################################################################################
 
 set -e
@@ -37,7 +35,7 @@ log_error() {
 log_header() {
     printf "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
     printf "${BLUE}$1${NC}\n"
-    printf "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━��━━━━━━━━━━${NC}\n"
+    printf "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
 }
 
 # ============================================================================
@@ -48,6 +46,7 @@ DEPLOY_PATH="/var/www/goldvninvest.online"
 DOMAIN="goldvninvest.online"
 EXCHANGE_NAME="goldvninvest"
 ADMIN_EMAIL="admin@goldvninvest.online"
+SUPPORT_EMAIL="support@goldvninvest.online"
 HOLLAEX_REPO="https://github.com/hollaex/hollaex-kit.git"
 NODE_VERSION="18"
 DOCKER_COMPOSE_VERSION="2.29.1"
@@ -70,16 +69,12 @@ check_os() {
         log_error "This script is designed for Linux systems only"
         exit 1
     fi
-    
-    if ! grep -q "Ubuntu\|Debian" /etc/os-release; then
-        log_warn "This script is tested on Ubuntu/Debian. Your OS may differ."
-    fi
 }
 
 check_disk_space() {
     DISK_SPACE=$(df "$DEPLOY_PATH" 2>/dev/null | tail -1 | awk '{print $4}' || echo "0")
     if [[ $DISK_SPACE -lt 5242880 ]]; then
-        log_error "Insufficient disk space. Minimum 5GB required, available: $((DISK_SPACE / 1024 / 1024))GB"
+        log_error "Insufficient disk space. Minimum 5GB required"
         exit 1
     fi
     log_info "Disk space OK: $((DISK_SPACE / 1024 / 1024))GB available"
@@ -87,18 +82,9 @@ check_disk_space() {
 
 fix_dpkg() {
     log_info "Fixing package manager conflicts..."
-    
-    # Check if dpkg is locked
-    if lsof /var/lib/apt/lists/lock &>/dev/null; then
-        log_warn "Package manager is locked. Waiting..."
-        sleep 10
-    fi
-    
-    # Fix dpkg
     dpkg --configure -a 2>/dev/null || true
     apt-get install -f -y 2>/dev/null || true
     apt-get update --fix-missing 2>/dev/null || true
-    
     log_info "Package manager fixed"
 }
 
@@ -161,13 +147,11 @@ install_docker_compose() {
     log_header "Installing Docker Compose V2"
     
     if command -v docker-compose &>/dev/null; then
-        COMPOSE_VERSION=$(docker-compose --version | grep -oP '\d+\.\d+\.\d+' | head -1)
-        log_warn "Docker Compose already installed: $COMPOSE_VERSION"
+        log_warn "Docker Compose already installed"
         return 0
     fi
     
     DOCKER_COMPOSE_URL="https://github.com/docker/compose/releases/download/v${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)"
-    
     curl -SL "$DOCKER_COMPOSE_URL" -o /usr/local/bin/docker-compose
     chmod +x /usr/local/bin/docker-compose
     
@@ -186,7 +170,6 @@ install_nodejs() {
     apt-get install -y nodejs
     
     log_info "Node.js installed: $(node --version)"
-    log_info "npm version: $(npm --version)"
 }
 
 # ============================================================================
@@ -207,11 +190,11 @@ prepare_deployment() {
         "$DEPLOY_PATH/server/logs" \
         "$DEPLOY_PATH/uploads" \
         "$DEPLOY_PATH/backups" \
-        "/var/log/hollaex-kit" \
-        "/var/lib/hollaex-kit"
+        "/var/log/goldvninvest" \
+        "/var/lib/goldvninvest"
     
     chmod 755 "$DEPLOY_PATH"/{server/logs,uploads,backups}
-    chmod 755 /var/log/hollaex-kit /var/lib/hollaex-kit
+    chmod 755 /var/log/goldvninvest /var/lib/goldvninvest
     
     log_info "Deployment directories prepared"
 }
@@ -251,108 +234,97 @@ generate_strong_password() {
 }
 
 setup_environment_file() {
-    log_header "Setting Up Environment Configuration"
+    log_header "Setting Up Environment Configuration for goldvninvest"
     
     ENV_FILE="$DEPLOY_PATH/server/hollaex-kit.env"
     
     # Generate strong passwords
     DB_PASSWORD=$(generate_strong_password)
     REDIS_PASSWORD=$(generate_strong_password)
-    JWT_SECRET=$(generate_strong_password)
-    SESSION_SECRET=$(generate_strong_password)
+    SECRET=$(generate_strong_password)
     
     cat > "$ENV_FILE" << ENVFILE
 # ============================================================================
-# HollaEx Kit Production Configuration for goldvninvest.online
+# HollaEx Kit Configuration - goldvninvest.online
 # Generated: $(date)
 # ============================================================================
 
-# Application Environment
+# Application Settings
 ENVIRONMENT=production
 EXCHANGE_NAME=$EXCHANGE_NAME
-DOMAIN=$DOMAIN
+DOMAIN=https://$DOMAIN
+API_HOST=https://$DOMAIN/api
+API_NAME=$EXCHANGE_NAME
+ISSUER=$EXCHANGE_NAME
 NODE_ENV=production
+KIT_VERSION=3.0.0
+PORT=10010
+WEBSOCKET_PORT=10080
 
-# API Configuration
-API_HOST=0.0.0.0
-API_PORT=10010
-STREAM_PORT=10080
-API_ENABLE_CORS=true
-CORS_ORIGIN=https://$DOMAIN,https://www.$DOMAIN
+# Network Configuration
+NETWORK=mainnet
+NETWORK_URL=https://api.hollaex.network
 
 # Database Configuration
-DB_NAME=hollaex
-DB_USERNAME=hollaex_user
-DB_PASSWORD=$DB_PASSWORD
+DB_DIALECT=postgres
 DB_HOST=hollaex-kit-db
 DB_PORT=5432
-DB_DIALECT=postgres
-DB_LOGGING=false
-DB_POOL_MIN=2
-DB_POOL_MAX=10
+DB_NAME=goldvninvest
+DB_USERNAME=goldvninvest_user
+DB_PASSWORD=$DB_PASSWORD
+DB_SSL=false
 
-# Redis Configuration
+# Redis/PubSub Configuration
 REDIS_HOST=hollaex-kit-redis
 REDIS_PORT=6379
 REDIS_PASSWORD=$REDIS_PASSWORD
-REDIS_DB=0
-REDIS_SSL=false
+PUBSUB_HOST=hollaex-kit-redis
+PUBSUB_PORT=6379
+PUBSUB_PASSWORD=$REDIS_PASSWORD
 
 # Security
-JWT_SECRET=$JWT_SECRET
-SESSION_SECRET=$SESSION_SECRET
-API_KEY_EXPIRE=3600
-REFRESH_TOKEN_EXPIRE=604800
-TOKEN_EXPIRY_WINDOW_MINUTES=15
-BCRYPT_ROUND=10
+SECRET=$SECRET
 
-# Email Configuration (Update with your SMTP)
-SMTP_HOST=smtp.example.com
+# Email Configuration
+ADMIN_EMAIL=$ADMIN_EMAIL
+SENDER_EMAIL=noreply@$DOMAIN
+SUPPORT_EMAIL=$SUPPORT_EMAIL
+KYC_EMAIL=$SUPPORT_EMAIL
+SUPERVISOR_EMAIL=$ADMIN_EMAIL
+SMTP_SERVER=smtp.example.com
 SMTP_PORT=587
 SMTP_USER=your-email@example.com
 SMTP_PASSWORD=your-password
-SMTP_FROM=noreply@$DOMAIN
-SMTP_TLS=true
+SEND_EMAIL_TO_SUPPORT=true
+
+# UI Configuration
+DEFAULT_THEME=dark
+NEW_USER_DEFAULT_LANGUAGE=en
+NEW_USER_IS_ACTIVATED=true
+VALID_LANGUAGES=en
+CURRENCIES=xht,usdt
+PAIRS=xht-usdt
+USER_LEVEL_NUMBER=4
 
 # Logging
 LOG_LEVEL=info
-LOG_FILE=/var/log/hollaex-kit/app.log
-LOG_FORMAT=combined
+EMAILS_TIMEZONE=UTC
 
-# Security Headers
-ENABLE_HELMET=true
-ENABLE_RATE_LIMIT=true
-RATE_LIMIT_WINDOW=900000
-RATE_LIMIT_MAX_REQUESTS=100
-
-# API Endpoints
-NETWORK_URL=https://api.hollaex.com
-NETWORK_TIMEOUT=30000
-
-# File Upload
-MAX_UPLOAD_SIZE=10485760
-UPLOAD_PATH=$DEPLOY_PATH/uploads
-
-# Exchange Settings
-MIN_ORDER_SIZE=0.01
-MAKER_FEE=0.001
-TAKER_FEE=0.002
-
-# Optional: AWS S3 for file storage
-AWS_ENABLED=false
-AWS_ACCESS_KEY_ID=
-AWS_SECRET_ACCESS_KEY=
-AWS_S3_BUCKET=
-AWS_REGION=us-east-1
+# Optional - Remove before production use
+ACTIVATION_CODE=
+API_KEY=
+API_SECRET=
+VAULT_NAME=
+LOGO_IMAGE=https://bitholla.s3.ap-northeast-2.amazonaws.com/kit/LOGO_IMAGE_LIGHT
 
 ENVFILE
     
     chmod 600 "$ENV_FILE"
     
     log_info "Environment file created: $ENV_FILE"
-    log_warn "⚠️  IMPORTANT: Database password: $DB_PASSWORD"
-    log_warn "⚠️  IMPORTANT: Redis password: $REDIS_PASSWORD"
-    log_warn "⚠️  UPDATE email settings in $ENV_FILE"
+    log_warn "⚠️  Generated passwords:"
+    log_warn "   Database: $DB_PASSWORD"
+    log_warn "⚠️  Update email settings in $ENV_FILE"
 }
 
 # ============================================================================
@@ -377,10 +349,10 @@ start_containers() {
     
     cd "$DEPLOY_PATH/server"
     
-    log_info "Starting services... (this may take a minute)"
+    log_info "Starting services..."
     docker-compose -f docker-compose-prod.yaml up -d
     
-    log_info "Waiting for services to initialize..."
+    log_info "Waiting for services to initialize (20 seconds)..."
     sleep 20
     
     log_info "Checking container status..."
@@ -409,12 +381,12 @@ configure_nginx() {
     log_header "Configuring Nginx Reverse Proxy"
     
     cat > /etc/nginx/sites-available/goldvninvest << 'NGINXCONFIG'
-upstream hollaex_api {
+upstream goldvninvest_api {
     server 127.0.0.1:10010 max_fails=3 fail_timeout=30s;
     keepalive 32;
 }
 
-upstream hollaex_stream {
+upstream goldvninvest_stream {
     server 127.0.0.1:10080 max_fails=3 fail_timeout=30s;
     keepalive 32;
 }
@@ -455,18 +427,16 @@ server {
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
     
     client_max_body_size 50M;
     proxy_read_timeout 90;
     
-    # Logging
     access_log /var/log/nginx/goldvninvest_access.log;
     error_log /var/log/nginx/goldvninvest_error.log;
     
     # API Proxy
     location / {
-        proxy_pass http://hollaex_api;
+        proxy_pass http://goldvninvest_api;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection 'upgrade';
@@ -480,32 +450,22 @@ server {
     
     # WebSocket Stream
     location /stream {
-        proxy_pass http://hollaex_stream;
+        proxy_pass http://goldvninvest_stream;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
-        proxy_buffering off;
-    }
-    
-    # Health check endpoint
-    location /health {
-        proxy_pass http://hollaex_api/api/public/health;
-        access_log off;
     }
 }
 NGINXCONFIG
     
-    # Enable site
     ln -sf /etc/nginx/sites-available/goldvninvest /etc/nginx/sites-enabled/
     rm -f /etc/nginx/sites-enabled/default
     
-    # Test configuration
     if nginx -t 2>/dev/null; then
         systemctl restart nginx
         log_info "Nginx configured and restarted"
@@ -531,86 +491,60 @@ setup_ssl_certificate() {
         --non-interactive \
         --agree-tos \
         --email "$ADMIN_EMAIL" \
-        -d "$DOMAIN" \
-        -d "www.$DOMAIN" 2>/dev/null
+        -d "goldvninvest.online" \
+        -d "www.goldvninvest.online" 2>/dev/null
     
-    # Setup auto-renewal
     systemctl enable certbot.timer
     systemctl start certbot.timer
     
-    log_info "SSL certificate installed and auto-renewal enabled"
+    log_info "SSL certificate installed"
 }
 
 # ============================================================================
 # VERIFICATION & HEALTH CHECKS
 # ============================================================================
 
-verify_dns() {
-    log_header "Verifying DNS Configuration"
-    
-    log_info "Checking DNS resolution for $DOMAIN..."
-    
-    IP=$(dig +short A "$DOMAIN" | tail -1)
-    
-    if [[ -z "$IP" ]]; then
-        log_warn "DNS not resolving yet. Please ensure DNS records are configured:"
-        log_warn "  A record: $DOMAIN -> 137.184.223.15"
-        log_warn "  A record: www.$DOMAIN -> 137.184.223.15"
-    else
-        log_info "DNS resolves to: $IP"
-    fi
-}
-
 health_check() {
     log_header "Running Health Checks"
     
-    # Check Docker containers
-    log_info "Checking Docker containers..."
     cd "$DEPLOY_PATH/server"
+    
+    log_info "Checking Docker containers..."
     
     if docker-compose -f docker-compose-prod.yaml ps | grep -q "hollaex-kit-db"; then
         log_info "✓ PostgreSQL database is running"
     else
-        log_error "✗ PostgreSQL database is not running"
+        log_warn "✗ PostgreSQL database is not running"
     fi
     
     if docker-compose -f docker-compose-prod.yaml ps | grep -q "hollaex-kit-redis"; then
         log_info "✓ Redis cache is running"
     else
-        log_error "✗ Redis cache is not running"
+        log_warn "✗ Redis cache is not running"
     fi
     
     if docker-compose -f docker-compose-prod.yaml ps | grep -q "hollaex-kit-server-api"; then
         log_info "✓ API server is running"
     else
-        log_error "✗ API server is not running"
+        log_warn "✗ API server is not running"
     fi
     
-    # Check Nginx
     if systemctl is-active --quiet nginx; then
         log_info "✓ Nginx is running"
     else
-        log_error "✗ Nginx is not running"
-    fi
-    
-    # Test API endpoint
-    log_info "Testing API endpoint..."
-    if curl -sf "http://localhost:10010/api/public/health" >/dev/null 2>&1; then
-        log_info "✓ API responds to health check"
-    else
-        log_warn "⚠ API health check failed (may need initialization)"
+        log_warn "✗ Nginx is not running"
     fi
 }
 
 # ============================================================================
-# MAINTENANCE & MONITORING
+# MAINTENANCE
 # ============================================================================
 
 setup_logrotate() {
     log_header "Setting Up Log Rotation"
     
-    cat > /etc/logrotate.d/hollaex-kit << 'LOGROTATE'
-/var/log/hollaex-kit/*.log {
+    cat > /etc/logrotate.d/goldvninvest << 'LOGROTATE'
+/var/log/goldvninvest/*.log {
     daily
     rotate 14
     compress
@@ -618,9 +552,6 @@ setup_logrotate() {
     notifempty
     create 0640 root root
     sharedscripts
-    postrotate
-        systemctl reload docker >/dev/null 2>&1 || true
-    endscript
 }
 LOGROTATE
     
@@ -630,9 +561,9 @@ LOGROTATE
 create_systemd_service() {
     log_header "Creating Systemd Service"
     
-    cat > /etc/systemd/system/hollaex-kit.service << 'SERVICEFILE'
+    cat > /etc/systemd/system/goldvninvest.service << 'SERVICEFILE'
 [Unit]
-Description=HollaEx Kit Exchange Platform
+Description=GoldVN Invest - HollaEx Kit Exchange Platform
 After=docker.service network-online.target
 Wants=network-online.target
 Requires=docker.service
@@ -649,20 +580,20 @@ ExecStop=/usr/bin/docker-compose -f docker-compose-prod.yaml down
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=hollaex-kit
+SyslogIdentifier=goldvninvest
 
 [Install]
 WantedBy=multi-user.target
 SERVICEFILE
     
     systemctl daemon-reload
-    systemctl enable hollaex-kit.service
+    systemctl enable goldvninvest.service
     
     log_info "Systemd service created and enabled"
 }
 
 # ============================================================================
-# FINAL SUMMARY
+# SUMMARY
 # ============================================================================
 
 print_summary() {
@@ -670,7 +601,7 @@ print_summary() {
 
 ╔═══════════════════════════════════════════════════════════════════════════╗
 ║                                                                           ║
-║          🎉 HollaEx Kit Installation Completed Successfully! 🎉          ║
+║        🎉 GoldVN Invest Deployment Completed Successfully! 🎉           ║
 ║                                                                           ║
 ║                    Domain: goldvninvest.online                          ║
 ║                 Server: root@137.184.223.15                             ║
@@ -682,7 +613,7 @@ print_summary() {
    ✓ Node.js v18 & npm
    ✓ PostgreSQL Client
    ✓ Nginx Web Server with SSL/TLS
-   ✓ HollaEx Kit Repository
+   ✓ HollaEx Kit Repository (goldvninvest)
    ✓ Docker Containers (PostgreSQL, Redis, API, WebSocket)
    ✓ Let's Encrypt SSL Certificate
    ✓ Systemd Service Manager
@@ -690,123 +621,65 @@ print_summary() {
 📍 IMPORTANT PATHS:
    ├─ Deploy Path:     /var/www/goldvninvest.online
    ├─ Config File:     /var/www/goldvninvest.online/server/hollaex-kit.env
-   ├─ Application Logs:/var/log/hollaex-kit/
+   ├─ Application Logs:/var/log/goldvninvest/
    ├─ Nginx Config:    /etc/nginx/sites-available/goldvninvest
    └─ Docker Compose:  /var/www/goldvninvest.online/server/docker-compose-prod.yaml
 
 🔗 ACCESS URLS:
    ├─ Web:     https://goldvninvest.online
    ├─ API:     https://goldvninvest.online/api
-   └─ Health:  https://goldvninvest.online/health
+   └─ WebSocket: wss://goldvninvest.online/stream
 
-⚠️  CRITICAL NEXT STEPS (REQUIRED FOR FULL OPERATION):
+⚠️  CRITICAL NEXT STEPS:
 
 1️⃣  VERIFY DNS CONFIGURATION:
-   Make sure these A records are set:
+   Make sure A records are set:
    ├─ goldvninvest.online          → 137.184.223.15
    └─ www.goldvninvest.online      → 137.184.223.15
 
 2️⃣  UPDATE EMAIL CONFIGURATION:
-   File: /var/www/goldvninvest.online/server/hollaex-kit.env
-   Update SMTP settings:
-   ├─ SMTP_HOST (your email service)
-   ├─ SMTP_USER (your email)
-   ├─ SMTP_PASSWORD (your password)
-   └─ SMTP_FROM (noreply@goldvninvest.online)
+   nano /var/www/goldvninvest.online/server/hollaex-kit.env
    
-   Then restart:
-   docker-compose -f /var/www/goldvninvest.online/server/docker-compose-prod.yaml restart
+   Update these fields:
+   - SMTP_SERVER (your email service)
+   - SMTP_USER (your email)
+   - SMTP_PASSWORD (your password)
 
-3️⃣  REGISTER OUTBOUND IP WITH HOLLAEX (IMPORTANT):
+3️⃣  REGISTER OUTBOUND IP WITH HOLLAEX:
    Email: support@hollaex.com
-   Subject: IP Registration for HollaEx Kit
-   Content: Please register IP 137.184.223.15 for production access
-   Note: This is required for network operations after June 1, 2026
+   Provide: IP 137.184.223.15 for goldvninvest.online
 
-4️⃣  TEST THE DEPLOYMENT:
-   # Check containers
+4️⃣  RESTART SERVICES:
+   systemctl restart goldvninvest
+
+5️⃣  TEST THE DEPLOYMENT:
    docker-compose -f /var/www/goldvninvest.online/server/docker-compose-prod.yaml ps
-   
-   # View API logs
-   docker-compose -f /var/www/goldvninvest.online/server/docker-compose-prod.yaml logs -f hollaex-kit-server-api
-   
-   # Health check
-   curl https://goldvninvest.online/health
-
-5️⃣  BACKUP DATABASE CREDENTIALS:
-   📝 Store these securely (NOT in version control):
-   ├─ Database Password: (see .env file)
-   ├─ Redis Password: (see .env file)
-   └─ JWT Secret: (see .env file)
+   curl https://goldvninvest.online/api
 
 📚 USEFUL COMMANDS:
+
+View Status:
+   systemctl status goldvninvest
+   docker-compose -f /var/www/goldvninvest.online/server/docker-compose-prod.yaml ps
 
 View Logs:
    docker-compose -f /var/www/goldvninvest.online/server/docker-compose-prod.yaml logs -f
 
-Check Status:
-   systemctl status hollaex-kit
-   docker-compose -f /var/www/goldvninvest.online/server/docker-compose-prod.yaml ps
-
 Restart Services:
-   systemctl restart hollaex-kit
-   # OR manually:
-   docker-compose -f /var/www/goldvninvest.online/server/docker-compose-prod.yaml restart
+   systemctl restart goldvninvest
 
 Stop Services:
    docker-compose -f /var/www/goldvninvest.online/server/docker-compose-prod.yaml down
 
-View Database:
-   # Connect to PostgreSQL
-   docker-compose -f /var/www/goldvninvest.online/server/docker-compose-prod.yaml exec hollaex-kit-db psql -U hollaex_user -d hollaex
+Check Nginx:
+   nginx -t
+   systemctl status nginx
 
-🔍 MONITORING & LOGS:
-
-Application Logs:
-   tail -f /var/log/hollaex-kit/app.log
-
-Nginx Logs:
-   tail -f /var/log/nginx/goldvninvest_*.log
-
-Docker Logs:
-   docker logs -f $(docker ps --filter "name=hollaex-kit-server-api" -q)
-
-SSL Certificate Renewal:
-   # Manual renewal (auto-renews daily):
-   certbot renew
-
-📖 DOCUMENTATION & SUPPORT:
-
-Official Docs:    https://docs.hollaex.com
-GitHub:           https://github.com/hollaex/hollaex-kit
-Community Forum:  https://forum.hollaex.com
-Discord:          https://discord.gg/RkRHU8RbyM
-
-🛟 TROUBLESHOOTING:
-
-If services won't start:
-   1. Check logs: docker-compose logs
-   2. Verify disk space: df -h
-   3. Check port conflicts: netstat -tlnp | grep :10010
-   4. Restart Docker: systemctl restart docker
-
-If SSL certificate fails:
-   1. Verify DNS is working: nslookup goldvninvest.online
-   2. Check firewall: ufw status
-   3. Manual renewal: certbot renew --dry-run
-   4. Check logs: certbot certificates
-
-If database connection fails:
-   1. Check containers: docker-compose ps
-   2. Verify environment: cat /var/www/goldvninvest.online/server/hollaex-kit.env
-   3. Check network: docker network ls
-   4. Restart containers: docker-compose restart
-
-════════════════════════════════════════════════════════════════════════════
+🎯 DOCUMENTATION:
+   https://docs.hollaex.com
+   https://github.com/hollaex/hollaex-kit
 
 ✨ Installation completed at: $(date)
-
-👨‍💻 Need help? Check the documentation or community forums above.
 
 SUMMARY
 }
@@ -816,10 +689,10 @@ SUMMARY
 # ============================================================================
 
 main() {
-    log_header "🚀 HollaEx Kit Production Deployment Setup"
+    log_header "🚀 GoldVN Invest - HollaEx Kit Production Deployment"
     log_info "Domain: $DOMAIN"
     log_info "Server: root@137.184.223.15"
-    log_info "Path: $DEPLOY_PATH"
+    log_info "Exchange: $EXCHANGE_NAME"
     log_info ""
     
     # Pre-flight checks
@@ -857,7 +730,6 @@ main() {
     create_systemd_service
     
     # Verification
-    verify_dns
     health_check
     
     # Summary
